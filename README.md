@@ -34,15 +34,16 @@ python main.py --dashboard
 
 Every cycle the bot:
 
-1. **Fetches live markets** from Kalshi (8 US city series) and Polymarket (weather tag)
+1. **Fetches live markets** from Kalshi (8 US city series) and Polymarket (weather tag) — **persists them to DB immediately** so market_id is never NULL
 2. **Pulls 5-model weather forecasts** — GFS, ECMWF, ICON, AROME, NOAA/NWS — with full run lineage
-3. **Applies bias correction** — per-city, per-model offsets learned from historical residuals
-4. **Computes calibrated probabilities** — Gaussian CDF with Platt temperature scaling, optimized weekly via walk-forward Brier scoring
+3. **Applies bias correction** — per-city, per-model offsets learned from historical residuals, integrated directly into signal generation
+4. **Computes calibrated probabilities** — Gaussian CDF with **dynamic forecast uncertainty** (scales with model spread, lead time, and season) + Platt temperature scaling, optimized weekly via walk-forward Brier scoring
 5. **Calculates executable edge** — VWAP through the real orderbook, Kalshi's price-dependent fee schedule, slippage buffer
 6. **Routes capital** — softmax allocation across strategies, capped [5%–40%] per strategy, half-Kelly position sizing
-7. **Enforces risk guards** — stale data halt, cluster cap, daily loss limit, city position limit
-8. **Logs everything** to SQLite — predictions, positions, forecasts, settlement data, experiments
-9. **Self-improves** — autoresearch loop proposes parameter variants, validates out-of-sample, promotes winners
+7. **Executes via abstracted executor** — `PaperExecutor` (default) or `KalshiExecutor` (live), swappable without touching strategy code
+8. **Enforces risk guards** — stale data halt, cluster cap, daily loss limit, city position limit
+9. **Logs everything** to SQLite — predictions, positions with **full entry snapshots** (high_f, consensus_f, edge, market_id), forecasts, settlement data, experiments
+10. **Self-improves** — autoresearch loop proposes single or combo parameter variants across 5-param search space, validates out-of-sample, promotes winners
 
 ---
 
@@ -61,10 +62,11 @@ weather-trading-bot/
 │   └── nws_settlement.py            # Official NWS settlement (NOAA CDO + IEM ASOS fallback)
 │
 ├── core/
-│   ├── forecaster.py                # Temperature scaling, Brier decomposition, prob_above_threshold
+│   ├── forecaster.py                # Temperature scaling, Brier decomposition, prob_above_threshold, dynamic_std_f
 │   └── signals.py                   # Edge calculation, executable edge, opportunity ranking
 │
 ├── execution/
+│   ├── exchange_executor.py         # ExchangeExecutor ABC, PaperExecutor, KalshiExecutor
 │   ├── orderbook.py                 # VWAP pricing, Kalshi fee schedule, slippage model
 │   └── lifecycle.py                 # Position state machine (OPENED → HOLDING → terminal)
 │
@@ -103,8 +105,8 @@ weather-trading-bot/
 │   └── types.py                     # ModelForecast, ConsensusForecast with lineage fields
 │
 ├── dashboard/
-│   ├── api.py                       # Flask micro-server — 14 REST endpoints
-│   └── index.html                   # React single-file dashboard — 4 tabs, no build step
+│   ├── api.py                       # Flask micro-server — 17 REST endpoints
+│   └── index.html                   # React single-file dashboard — 4 tabs, QuickStats bar, no build step
 │
 └── tests/                           # 440 tests, 2 skipped (scipy optional)
     ├── test_db.py
@@ -154,14 +156,27 @@ Near-50¢ contracts that look profitable on raw edge often aren't after fees. Th
 ### Probability Model
 
 ```
-raw_prob = 1 - CDF((threshold_f - consensus_f) / base_std_f)
+raw_prob = 1 - CDF((threshold_f - consensus_f) / dynamic_std_f)
 scaled   = sigmoid(logit(raw_prob) / T)
 ```
 
 - `consensus_f` = confidence-weighted average of de-biased model forecasts
-- `base_std_f` calibrated weekly via walk-forward Brier scoring
+- `dynamic_std_f` replaces the static `base_std_f` — adjusts uncertainty upward for high model spread, long lead times, and summer contracts (see below)
 - `T` (temperature) calibrated alongside `base_std_f`
 - Logit clamped to `[-30, 30]`, output to `(1e-6, 1-1e-6)`
+
+### Dynamic Forecast Uncertainty
+
+Static uncertainty (`base_std_f = 5.0°F` for all cities and lead times) underestimates risk in high-disagreement or long-range scenarios. `dynamic_std_f()` scales it up based on three factors:
+
+```
+std = base_std_f
+    + min(3.0, (lead_days - 1) × 0.5)   # +0.5°F per day beyond 24h, capped at +3°F
+    + 0.3 × model_spread                 # 30% of inter-model std-dev
+    × 1.15 if summer (Jun–Aug)           # seasonal variance boost
+```
+
+This makes the bot systematically more conservative on week-ahead contracts and high-disagreement markets.
 
 ### Bias Correction
 
@@ -210,10 +225,22 @@ This gives the freshest possible estimate of the final daily high, often catchin
 
 Inspired by Karpathy's autoresearch concept — automated parameter improvement without human intervention:
 
-1. **Propose** — perturb one parameter from the current best (`base_std_f ± 0.5`, `temp_T ± 0.1`)
+1. **Propose** — perturb one or two parameters from the current best (see search space below)
 2. **Validate** — walk-forward Brier scoring on historical resolved trades
 3. **Compare** — measure improvement vs. current production params
 4. **Promote** — automatically apply if improvement > 5%; record in `experiments` table for audit
+
+**Search space (5 parameters + 2-param combos every 5th experiment):**
+
+| Parameter | Range | Step |
+|---|---|---|
+| `base_std_f` | 2.5 – 12.0 | 0.5 |
+| `temp_T` | 0.7 – 1.8 | 0.1 |
+| `min_executable_edge` | 0.02 – 0.15 | 0.01 |
+| `max_kelly_fraction` | 0.05 – 0.40 | 0.05 |
+| `stale_forecast_hours` | 6 – 48 | 6 |
+
+Combo proposals (every 5th run): `[base_std_f, temp_T]` and `[min_executable_edge, max_kelly_fraction]`.
 
 ---
 
@@ -243,7 +270,7 @@ python main.py --dashboard --port 8080    # custom port
 
 ## Dashboard
 
-Start the bot in one terminal, the dashboard API in another, and open the HTML file in a browser — no build step required.
+Start the bot in one terminal, the dashboard API in another, and open the HTML file in a browser — no build step required. A **QuickStats bar** across the top of every tab shows live bankroll, P&L, open positions, win rate, and last-cycle summary. A **Last Cycle panel** at the top of Tab 1 shows signals generated, executed, and exits from the most recent run.
 
 ```bash
 # Terminal 1
@@ -273,6 +300,7 @@ open dashboard/index.html
 - Full experiment registry with baseline vs. candidate Brier comparison
 - Improvement % and promotion status per experiment
 - Promotion candidates highlighted (score > 75, shadow mode)
+- **▶ Run Experiment** button — triggers one autoresearch cycle from the browser
 
 **Tab 4 — Forecast Quality**
 - Per-city, per-model bias chart (°F systematic error)
@@ -318,15 +346,16 @@ Key parameters in `shared/params.py`:
 
 | Parameter | Default | Calibrated? | Description |
 |---|---|---|---|
-| `base_std_f` | `5.0` | ✅ Weekly | Forecast std dev in °F |
+| `base_std_f` | `5.0` | ✅ Weekly | Baseline forecast std dev in °F (dynamic_std_f scales this up) |
 | `temp_T` | `1.0` | ✅ Weekly | Platt temperature scaling factor |
-| `min_executable_edge` | `0.05` | — | Min edge after full cost stack |
+| `min_executable_edge` | `0.05` | ✅ Autoresearch | Min edge after full cost stack |
+| `max_kelly_fraction` | `0.25` | ✅ Autoresearch | Kelly fraction cap per position |
+| `stale_forecast_hours` | `12.0` | ✅ Autoresearch | Hours before a forecast is stale |
 | `slippage_buffer_cents` | `1.0` | — | Slippage padding in cents |
 | `min_depth_usd` | `50.0` | — | Min orderbook depth to trade |
 | `daily_loss_limit_usd` | `50.0` | — | Daily loss halt threshold |
 | `cluster_cap_usd` | `200.0` | — | Max exposure per geographic cluster |
 | `max_positions_per_city` | `3` | — | Max concurrent positions per city |
-| `half_kelly_fraction` | `0.5` | — | Kelly fraction (conservative) |
 
 ---
 
@@ -484,6 +513,16 @@ Tests: **440 passing**, 2 skipped (scipy differential evolution — install scip
 
 ## Roadmap
 
+### Recently Completed (V5 Audit)
+- [x] Markets persisted to DB before signal generation (market_id always populated)
+- [x] Full entry snapshots stored in `positions.entry_reason` JSON
+- [x] Bias correction integrated into ValueEntry signal pipeline
+- [x] Dynamic forecast uncertainty (`dynamic_std_f`) — lead time + model spread + season
+- [x] `ExchangeExecutor` abstraction (`PaperExecutor` / `KalshiExecutor`)
+- [x] Autoresearch search space expanded to 5 params + 2-param combo proposals
+- [x] Dashboard: QuickStats bar, Last Cycle panel, Run Experiment button, 3 new endpoints
+
+### Next Milestones
 - [ ] Polymarket live execution (CLOB order signing)
 - [ ] EMOS post-processing on raw forecasts (proper ensemble calibration)
 - [ ] Maker-first execution (Kalshi maker rebate exploitation)
