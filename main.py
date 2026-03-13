@@ -164,13 +164,33 @@ def run_calibrate() -> None:
     print(f"[calibrate] done: {result}")
 
 
-def run_dashboard() -> None:
+def run_autoresearch() -> None:
+    """Propose and run one autoresearch experiment cycle."""
+    from research.autoresearch import ExperimentRegistry
+    from research.calibrator import _build_trade_log
+    conn = init_db()
+    trade_log = _build_trade_log(conn)
+    if len(trade_log) < 6:
+        print(f"[autoresearch] Not enough resolved trades ({len(trade_log)}) to run experiments.")
+        return
+    registry = ExperimentRegistry(conn, PARAMS)
+    result = registry.run_cycle(trade_log)
+    print(
+        f"[autoresearch] experiment={result['experiment_id']} "
+        f"baseline={result['baseline_brier']:.4f} "
+        f"candidate={result['candidate_brier']:.4f} "
+        f"improvement={result['improvement_pct']:.1f}% "
+        f"promoted={result['promoted']}"
+    )
+
+
+def run_dashboard(port: int = 5001) -> None:
     """Start the dashboard API server."""
     try:
-        import dashboard.api as api
-        api.run()
+        from dashboard.api import run
+        run(port=port)
     except ImportError:
-        print("[dashboard] dashboard/api.py not found. Run Phase C setup first.")
+        print("[dashboard] flask not installed. Run: pip install flask")
 
 
 if __name__ == "__main__":
@@ -189,10 +209,16 @@ if __name__ == "__main__":
                         help="Run calibration cycle and exit")
     parser.add_argument("--dashboard", action="store_true",
                         help="Start dashboard API server")
+    parser.add_argument("--port", type=int, default=5001,
+                        help="Dashboard port (default: 5001)")
+    parser.add_argument("--autoresearch", action="store_true",
+                        help="Run one autoresearch experiment cycle")
     args = parser.parse_args()
 
     if args.dashboard:
-        run_dashboard()
+        run_dashboard(port=args.port)
+    elif args.autoresearch:
+        run_autoresearch()
     elif args.calibrate:
         run_calibrate()
     elif args.loop:

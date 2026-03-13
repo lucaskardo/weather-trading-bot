@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Weather Trading Bot</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh; }
+    .header { background: #1a1d2e; border-bottom: 1px solid #2d3748; padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
+    .header h1 { font-size: 20px; font-weight: 700; color: #63b3ed; }
+    .badge { background: #2d3748; color: #68d391; padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+    .badge.live { background: #22543d; color: #68d391; }
+    .badge.paper { background: #2a4365; color: #90cdf4; }
+    .tabs { display: flex; background: #1a1d2e; border-bottom: 1px solid #2d3748; padding: 0 24px; gap: 4px; }
+    .tab { padding: 12px 20px; cursor: pointer; border-bottom: 3px solid transparent; font-size: 14px; color: #718096; transition: all 0.15s; }
+    .tab:hover { color: #e2e8f0; }
+    .tab.active { color: #63b3ed; border-bottom-color: #63b3ed; font-weight: 600; }
+    .content { padding: 24px; max-width: 1400px; margin: 0 auto; }
+    .grid { display: grid; gap: 16px; }
+    .grid-2 { grid-template-columns: repeat(2, 1fr); }
+    .grid-3 { grid-template-columns: repeat(3, 1fr); }
+    .grid-4 { grid-template-columns: repeat(4, 1fr); }
+    .card { background: #1a1d2e; border: 1px solid #2d3748; border-radius: 10px; padding: 20px; }
+    .card h3 { font-size: 13px; color: #718096; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }
+    .stat-value { font-size: 28px; font-weight: 700; color: #e2e8f0; }
+    .stat-sub { font-size: 12px; color: #718096; margin-top: 4px; }
+    .pos { color: #68d391; }
+    .neg { color: #fc8181; }
+    .neutral { color: #90cdf4; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { text-align: left; padding: 8px 12px; color: #718096; font-weight: 500; border-bottom: 1px solid #2d3748; font-size: 12px; text-transform: uppercase; }
+    td { padding: 8px 12px; border-bottom: 1px solid #1e2433; vertical-align: middle; }
+    tr:hover td { background: #222640; }
+    .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+    .tag.won { background: #22543d; color: #68d391; }
+    .tag.lost { background: #742a2a; color: #fc8181; }
+    .tag.open { background: #2a4365; color: #90cdf4; }
+    .tag.shadow { background: #44337a; color: #d6bcfa; }
+    .tag.promoted { background: #1a365d; color: #63b3ed; }
+    .tag.pending { background: #2d3748; color: #a0aec0; }
+    .loading { color: #718096; font-size: 14px; text-align: center; padding: 40px; }
+    .error-msg { color: #fc8181; font-size: 13px; padding: 8px; background: #742a2a22; border-radius: 6px; }
+    .refresh-btn { margin-left: auto; background: #2d3748; color: #90cdf4; border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+    .refresh-btn:hover { background: #4a5568; }
+    .bar-container { display: flex; align-items: center; gap: 8px; }
+    .bar { height: 8px; border-radius: 4px; background: #2d3748; flex: 1; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
+    .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    .section-header h2 { font-size: 16px; font-weight: 600; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const API = "http://localhost:5001/api";
+
+function useApi(endpoint, deps = []) {
+  const [data, setData] = React.useState(null);
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState(null);
+  React.useEffect(() => {
+    setLoading(true);
+    fetch(API + endpoint)
+      .then(r => r.json())
+      .then(d => { setData(d); setLoading(false); })
+      .catch(e => { setError(e.message); setLoading(false); });
+  }, deps);
+  return { data, loading, error };
+}
+
+function fmt(v, decimals = 2) {
+  if (v == null) return "—";
+  return Number(v).toFixed(decimals);
+}
+
+function fmtPnl(v) {
+  if (v == null) return <span className="neutral">—</span>;
+  const n = Number(v);
+  return <span className={n >= 0 ? "pos" : "neg"}>{n >= 0 ? "+" : ""}{n.toFixed(2)}</span>;
+}
+
+function fmtPct(v) {
+  if (v == null) return "—";
+  return (Number(v) * 100).toFixed(1) + "%";
+}
+
+function StatusTag({ status }) {
+  const s = (status || "").toLowerCase();
+  let cls = "open";
+  if (s === "won") cls = "won";
+  else if (s === "lost") cls = "lost";
+  else if (s === "shadow") cls = "shadow";
+  else if (s === "promoted") cls = "promoted";
+  else if (s === "pending" || s === "running") cls = "pending";
+  return <span className={`tag ${cls}`}>{status}</span>;
+}
+
+// ─── Tab 1: Live Trading ────────────────────────────────────────────────────
+function Tab1() {
+  const { data: portfolio } = useApi("/portfolio");
+  const { data: positions, loading: posLoading } = useApi("/positions?status=open&limit=50");
+  const { data: recent } = useApi("/trades/recent?limit=20");
+  const { data: allocations } = useApi("/allocations");
+  const { data: clusters } = useApi("/cluster_exposure");
+
+  const bankroll = portfolio?.bankroll ?? 0;
+  const totalPnl = portfolio?.total_pnl ?? 0;
+
+  return (
+    <div className="grid" style={{gap: 20}}>
+      {/* KPI row */}
+      <div className="grid grid-4">
+        <div className="card">
+          <h3>Bankroll</h3>
+          <div className="stat-value">${fmt(bankroll)}</div>
+          <div className="stat-sub">Available capital</div>
+        </div>
+        <div className="card">
+          <h3>Total P&L</h3>
+          <div className="stat-value">{fmtPnl(totalPnl)}</div>
+          <div className="stat-sub">All time</div>
+        </div>
+        <div className="card">
+          <h3>Open Positions</h3>
+          <div className="stat-value">{positions?.length ?? "—"}</div>
+          <div className="stat-sub">Across all strategies</div>
+        </div>
+        <div className="card">
+          <h3>Exposure</h3>
+          <div className="stat-value">${fmt(positions?.reduce((s, p) => s + (p.size_usd || 0), 0) ?? 0)}</div>
+          <div className="stat-sub">Total open notional</div>
+        </div>
+      </div>
+
+      <div className="grid grid-2">
+        {/* Strategy allocation */}
+        <div className="card">
+          <h3>Strategy Allocation</h3>
+          {allocations?.map(a => (
+            <div key={a.strategy_name} style={{marginBottom: 12}}>
+              <div style={{display: 'flex', justifyContent: 'space-between', fontSize: 13, marginBottom: 4}}>
+                <span>{a.strategy_name}</span>
+                <span className="neutral">${fmt(a.total_exposure || 0)}</span>
+              </div>
+              <div className="bar-container">
+                <div className="bar">
+                  <div className="bar-fill" style={{
+                    width: `${Math.min(100, (a.total_exposure || 0) / Math.max(bankroll, 1) * 100)}%`,
+                    background: '#63b3ed'
+                  }}/>
+                </div>
+                <span style={{fontSize: 12, color: '#718096', minWidth: 36}}>
+                  {fmt((a.total_exposure || 0) / Math.max(bankroll, 1) * 100, 1)}%
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Cluster exposure */}
+        <div className="card">
+          <h3>Cluster Exposure</h3>
+          {clusters?.map(c => (
+            <div key={c.city} style={{display: 'flex', justifyContent: 'space-between', fontSize: 13, padding: '4px 0', borderBottom: '1px solid #1e2433'}}>
+              <span>{c.city}</span>
+              <span>${fmt(c.exposure_usd || 0)} ({c.open_positions} pos)</span>
+            </div>
+          ))}
+          {(!clusters || clusters.length === 0) && <div className="stat-sub">No open positions</div>}
+        </div>
+      </div>
+
+      {/* Open positions */}
+      <div className="card">
+        <div className="section-header">
+          <h2>Open Positions</h2>
+        </div>
+        {posLoading ? <div className="loading">Loading...</div> : (
+          <table>
+            <thead><tr>
+              <th>Ticker</th><th>City</th><th>Side</th><th>Entry</th>
+              <th>Size</th><th>Edge</th><th>Opened</th><th>Status</th>
+            </tr></thead>
+            <tbody>
+              {(positions || []).map(p => (
+                <tr key={p.id}>
+                  <td style={{fontFamily: 'monospace', fontSize: 12}}>{p.ticker}</td>
+                  <td>{p.city}</td>
+                  <td><span className={p.side === 'YES' ? 'pos' : 'neg'}>{p.side}</span></td>
+                  <td>{fmt(p.entry_price, 3)}</td>
+                  <td>${fmt(p.size_usd)}</td>
+                  <td>{p.executable_edge != null ? fmt(p.executable_edge, 3) : "—"}</td>
+                  <td style={{fontSize: 11, color: '#718096'}}>{(p.opened_at || "").substring(0, 16)}</td>
+                  <td><StatusTag status={p.status} /></td>
+                </tr>
+              ))}
+              {(!positions || positions.length === 0) && (
+                <tr><td colSpan={8} style={{textAlign: 'center', color: '#718096', padding: 24}}>No open positions</td></tr>
+              )}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* Recent trades */}
+      <div className="card">
+        <h2 style={{marginBottom: 16}}>Recent Trades</h2>
+        <table>
+          <thead><tr>
+            <th>Strategy</th><th>Ticker</th><th>City</th>
+            <th>Fair Value</th><th>Market Price</th><th>Edge</th><th>Time</th>
+          </tr></thead>
+          <tbody>
+            {(recent || []).map(t => (
+              <tr key={t.id}>
+                <td>{t.strategy_name}</td>
+                <td style={{fontFamily: 'monospace', fontSize: 12}}>{t.ticker}</td>
+                <td>{t.city}</td>
+                <td>{fmt(t.fair_value, 3)}</td>
+                <td>{fmt(t.market_price, 3)}</td>
+                <td className={t.executable_edge > 0 ? 'pos' : 'neg'}>{fmt(t.executable_edge, 3)}</td>
+                <td style={{fontSize: 11, color: '#718096'}}>{(t.created_at || "").substring(0, 16)}</td>
+              </tr>
+            ))}
+            {(!recent || recent.length === 0) && (
+              <tr><td colSpan={7} style={{textAlign: 'center', color: '#718096', padding: 24}}>No trades yet</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─── Tab 2: Strategy Performance ────────────────────────────────────────────
+function Tab2() {
+  const { data: perf } = useApi("/strategy_performance");
+  const { data: brier } = useApi("/brier_trend");
+  const { data: mfemae } = useApi("/mfe_mae?limit=200");
+
+  return (
+    <div className="grid" style={{gap: 20}}>
+      <div className="card">
+        <h2 style={{marginBottom: 16}}>Per-Strategy KPIs</h2>
+        <table>
+          <thead><tr>
+            <th>Strategy</th><th>Type</th><th>Trades</th><th>Win Rate</th>
+            <th>Total P&L</th><th>Avg P&L</th><th>Avg Hold (h)</th>
+            <th>Avg MFE</th><th>Avg MAE</th>
+          </tr></thead>
+          <tbody>
+            {(perf || []).map((s, i) => (
+              <tr key={i}>
+                <td><strong>{s.strategy_name}</strong></td>
+                <td>{s.is_shadow ? <span className="tag shadow">Shadow</span> : <span className="tag open">Live</span>}</td>
+                <td>{s.trade_count}</td>
+                <td>{fmtPct(s.win_rate)}</td>
+                <td>{fmtPnl(s.total_pnl)}</td>
+                <td>{fmtPnl(s.avg_pnl)}</td>
+                <td>{fmt(s.avg_hold_hours, 1)}</td>
+                <td>{fmt(s.avg_mfe, 3)}</td>
+                <td>{fmt(s.avg_mae, 3)}</td>
+              </tr>
+            ))}
+            {(!perf || perf.length === 0) && (
+              <tr><td colSpan={9} style={{textAlign: 'center', color: '#718096', padding: 24}}>No resolved trades yet</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="grid grid-2">
+        <div className="card">
+          <h3>Brier Score Trend</h3>
+          {(brier || []).length === 0
+            ? <div className="stat-sub">No data yet</div>
+            : <table>
+                <thead><tr><th>Strategy</th><th>Date</th><th>Avg Brier</th><th>N</th></tr></thead>
+                <tbody>
+                  {(brier || []).slice(-20).map((b, i) => (
+                    <tr key={i}>
+                      <td>{b.strategy_name}</td>
+                      <td>{b.date}</td>
+                      <td className={b.avg_brier < 0.2 ? 'pos' : 'neg'}>{fmt(b.avg_brier, 4)}</td>
+                      <td>{b.n}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+          }
+        </div>
+
+        <div className="card">
+          <h3>MFE vs MAE (last 200 trades)</h3>
+          {(mfemae || []).length === 0
+            ? <div className="stat-sub">No data yet</div>
+            : <table>
+                <thead><tr><th>Strategy</th><th>City</th><th>MFE</th><th>MAE</th><th>P&L</th></tr></thead>
+                <tbody>
+                  {(mfemae || []).slice(0, 15).map((m, i) => (
+                    <tr key={i}>
+                      <td>{m.strategy_name}</td>
+                      <td>{m.city}</td>
+                      <td className="pos">{fmt(m.mfe, 3)}</td>
+                      <td className="neg">{fmt(m.mae, 3)}</td>
+                      <td>{fmtPnl(m.realized_pnl)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+          }
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Tab 3: Autoresearch ─────────────────────────────────────────────────────
+function Tab3() {
+  const { data: exps } = useApi("/experiments?limit=30");
+  const { data: candidates } = useApi("/promotion_candidates");
+
+  return (
+    <div className="grid" style={{gap: 20}}>
+      {/* Promotion candidates */}
+      {candidates && candidates.length > 0 && (
+        <div className="card" style={{border: '1px solid #3182ce'}}>
+          <h3 style={{color: '#63b3ed'}}>⭐ Promotion Candidates</h3>
+          <table>
+            <thead><tr><th>Strategy</th><th>Score</th><th>Trades</th><th>Win Rate</th><th>Brier</th><th>Computed At</th></tr></thead>
+            <tbody>
+              {candidates.map((c, i) => (
+                <tr key={i}>
+                  <td><strong>{c.strategy_name}</strong></td>
+                  <td className="pos">{fmt(c.score, 1)}</td>
+                  <td>{c.trade_count}</td>
+                  <td>{fmtPct(c.win_rate)}</td>
+                  <td>{fmt(c.avg_brier, 4)}</td>
+                  <td style={{fontSize: 11, color: '#718096'}}>{(c.computed_at || "").substring(0, 16)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Experiment registry */}
+      <div className="card">
+        <h2 style={{marginBottom: 16}}>Experiment Registry</h2>
+        <table>
+          <thead><tr>
+            <th>ID</th><th>Description</th><th>Baseline Brier</th><th>Candidate Brier</th>
+            <th>Improvement</th><th>Trades</th><th>Status</th><th>Date</th>
+          </tr></thead>
+          <tbody>
+            {(exps || []).map(e => (
+              <tr key={e.id}>
+                <td style={{fontFamily: 'monospace', fontSize: 12}}>{e.id}</td>
+                <td style={{maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis'}}>{e.description}</td>
+                <td>{fmt(e.baseline_brier, 4)}</td>
+                <td>{fmt(e.candidate_brier, 4)}</td>
+                <td className={e.improvement_pct > 0 ? 'pos' : 'neg'}>
+                  {e.improvement_pct != null ? (e.improvement_pct > 0 ? "+" : "") + fmt(e.improvement_pct, 1) + "%" : "—"}
+                </td>
+                <td>{e.trade_count ?? "—"}</td>
+                <td><StatusTag status={e.status} /></td>
+                <td style={{fontSize: 11, color: '#718096'}}>{(e.created_at || "").substring(0, 16)}</td>
+              </tr>
+            ))}
+            {(!exps || exps.length === 0) && (
+              <tr><td colSpan={8} style={{textAlign: 'center', color: '#718096', padding: 24}}>
+                No experiments yet. Run: <code>python main.py --autoresearch</code>
+              </td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─── Tab 4: Forecast Quality ─────────────────────────────────────────────────
+function Tab4() {
+  const { data: bias } = useApi("/forecast_bias");
+  const { data: agreement } = useApi("/model_agreement");
+  const { data: scatter } = useApi("/settlement_vs_forecast");
+
+  return (
+    <div className="grid" style={{gap: 20}}>
+      <div className="grid grid-2">
+        <div className="card">
+          <h3>Per-City, Per-Model Bias</h3>
+          <table>
+            <thead><tr><th>City</th><th>Model</th><th>N</th><th>Bias (°F)</th><th>MAE (°F)</th></tr></thead>
+            <tbody>
+              {(bias || []).map((b, i) => (
+                <tr key={i}>
+                  <td>{b.city}</td>
+                  <td>{b.model_name}</td>
+                  <td>{b.n_obs}</td>
+                  <td className={Math.abs(b.bias_f) < 1 ? 'pos' : 'neg'}>{fmt(b.bias_f, 2)}</td>
+                  <td>{fmt(b.mae_f, 2)}</td>
+                </tr>
+              ))}
+              {(!bias || bias.length === 0) && (
+                <tr><td colSpan={5} style={{textAlign: 'center', color: '#718096', padding: 24}}>
+                  No resolved forecasts yet
+                </td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="card">
+          <h3>Model Agreement (recent)</h3>
+          <table>
+            <thead><tr><th>City</th><th>Date</th><th>Models</th><th>Mean High</th><th>Spread</th></tr></thead>
+            <tbody>
+              {(agreement || []).slice(0, 15).map((a, i) => (
+                <tr key={i}>
+                  <td>{a.city}</td>
+                  <td>{a.target_date}</td>
+                  <td>{a.n_models}</td>
+                  <td>{fmt(a.mean_high_f, 1)}°F</td>
+                  <td className={a.spread_f > 5 ? 'neg' : 'pos'}>{fmt(a.spread_f, 1)}°F</td>
+                </tr>
+              ))}
+              {(!agreement || agreement.length === 0) && (
+                <tr><td colSpan={5} style={{textAlign: 'center', color: '#718096', padding: 24}}>No forecasts yet</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="card">
+        <h3>Settlement vs Forecast (residuals)</h3>
+        <table>
+          <thead><tr><th>City</th><th>Model</th><th>Date</th><th>Predicted</th><th>Actual</th><th>Residual</th></tr></thead>
+          <tbody>
+            {(scatter || []).slice(0, 20).map((s, i) => (
+              <tr key={i}>
+                <td>{s.city}</td>
+                <td>{s.model_name}</td>
+                <td>{s.target_date}</td>
+                <td>{fmt(s.predicted_high_f, 1)}°F</td>
+                <td>{fmt(s.actual_high_f, 1)}°F</td>
+                <td className={Math.abs(s.residual) < 2 ? 'pos' : 'neg'}>{fmt(s.residual, 1)}°F</td>
+              </tr>
+            ))}
+            {(!scatter || scatter.length === 0) && (
+              <tr><td colSpan={6} style={{textAlign: 'center', color: '#718096', padding: 24}}>No settlement data yet</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─── Root App ────────────────────────────────────────────────────────────────
+function App() {
+  const [tab, setTab] = React.useState(0);
+  const [lastUpdate, setLastUpdate] = React.useState(new Date().toLocaleTimeString());
+  const tabs = ["Live Trading", "Strategy Performance", "Autoresearch", "Forecast Quality"];
+
+  function refresh() {
+    setLastUpdate(new Date().toLocaleTimeString());
+    // Force re-render by toggling tab
+    setTab(t => t);
+    window.location.reload();
+  }
+
+  return (
+    <div>
+      <div className="header">
+        <h1>🌤 Weather Trading Bot</h1>
+        <span className="badge paper">Paper Mode</span>
+        <span style={{fontSize: 12, color: '#718096', marginLeft: 8}}>
+          Updated: {lastUpdate}
+        </span>
+        <button className="refresh-btn" onClick={refresh}>↻ Refresh</button>
+      </div>
+      <div className="tabs">
+        {tabs.map((t, i) => (
+          <div key={i} className={`tab ${tab === i ? "active" : ""}`} onClick={() => setTab(i)}>
+            {t}
+          </div>
+        ))}
+      </div>
+      <div className="content">
+        {tab === 0 && <Tab1 />}
+        {tab === 1 && <Tab2 />}
+        {tab === 2 && <Tab3 />}
+        {tab === 3 && <Tab4 />}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
