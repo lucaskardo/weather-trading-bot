@@ -99,6 +99,66 @@ function StatusTag({ status }) {
   return <span className={`tag ${cls}`}>{status}</span>;
 }
 
+// ─── Quick Stats Bar ────────────────────────────────────────────────────────
+function QuickStats() {
+  const { data, loading } = useApi("/quick_stats");
+  if (loading || !data) return null;
+  const items = [
+    { label: "Bankroll", value: `$${fmt(data.bankroll)}` },
+    { label: "Total P&L", value: fmtPnl(data.total_pnl) },
+    { label: "Open", value: data.open_positions ?? "—" },
+    { label: "Win Rate", value: data.win_rate != null ? fmtPct(data.win_rate) : "—" },
+    { label: "Experiments", value: data.experiments_run ?? "—" },
+  ];
+  return (
+    <div style={{display:'flex', gap:12, padding:'10px 24px', background:'#131625', borderBottom:'1px solid #2d3748', flexWrap:'wrap'}}>
+      {items.map(it => (
+        <div key={it.label} style={{display:'flex', gap:6, alignItems:'center', fontSize:13}}>
+          <span style={{color:'#718096'}}>{it.label}:</span>
+          <span style={{fontWeight:600}}>{it.value}</span>
+        </div>
+      ))}
+      {data.last_cycle?.cycle_at && (
+        <div style={{marginLeft:'auto', fontSize:11, color:'#718096'}}>
+          Last cycle: {new Date(data.last_cycle.cycle_at).toLocaleTimeString()} &nbsp;
+          signals={data.last_cycle.signals_generated ?? "—"} &nbsp;
+          executed={data.last_cycle.executed ?? "—"}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Last Cycle Panel ────────────────────────────────────────────────────────
+function LastCyclePanel() {
+  const { data, loading } = useApi("/last_cycle");
+  if (loading || !data || !data.cycle_at) return null;
+  return (
+    <div className="card" style={{marginBottom: 16}}>
+      <h3>Last Cycle — {new Date(data.cycle_at).toLocaleString()}</h3>
+      <div style={{display:'flex', gap:20, flexWrap:'wrap', marginTop: 8}}>
+        {[
+          ["Signals Generated", data.signals_generated],
+          ["Executable", data.signals_executable],
+          ["Shadow", data.signals_shadow],
+          ["Filtered", data.signals_filtered],
+          ["Executed", data.executed],
+          ["Exits", data.exits],
+        ].map(([label, val]) => (
+          <div key={label}>
+            <div style={{fontSize:12, color:'#718096'}}>{label}</div>
+            <div style={{fontSize:20, fontWeight:700}}>{val ?? "—"}</div>
+          </div>
+        ))}
+        <div>
+          <div style={{fontSize:12, color:'#718096'}}>Dry Run</div>
+          <div style={{fontSize:20, fontWeight:700}}>{data.dry_run ? "Yes" : "No"}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Tab 1: Live Trading ────────────────────────────────────────────────────
 function Tab1() {
   const { data: portfolio } = useApi("/portfolio");
@@ -112,6 +172,7 @@ function Tab1() {
 
   return (
     <div className="grid" style={{gap: 20}}>
+      <LastCyclePanel />
       {/* KPI row */}
       <div className="grid grid-4">
         <div className="card">
@@ -323,9 +384,41 @@ function Tab2() {
 function Tab3() {
   const { data: exps } = useApi("/experiments?limit=30");
   const { data: candidates } = useApi("/promotion_candidates");
+  const [running, setRunning] = React.useState(false);
+  const [runResult, setRunResult] = React.useState(null);
+
+  function runExperiment() {
+    setRunning(true);
+    setRunResult(null);
+    fetch(API + "/autoresearch/run", { method: "POST" })
+      .then(r => r.json())
+      .then(d => { setRunResult(d); setRunning(false); })
+      .catch(e => { setRunResult({ error: e.message }); setRunning(false); });
+  }
 
   return (
     <div className="grid" style={{gap: 20}}>
+      {/* Run button */}
+      <div className="card" style={{display:'flex', alignItems:'center', gap:16, padding:16}}>
+        <button
+          onClick={runExperiment}
+          disabled={running}
+          style={{background: running ? '#2d3748' : '#2b6cb0', color:'#fff', border:'none', padding:'8px 20px', borderRadius:6, cursor: running ? 'not-allowed' : 'pointer', fontWeight:600}}
+        >
+          {running ? "Running…" : "▶ Run Experiment"}
+        </button>
+        {runResult && !runResult.error && (
+          <span style={{fontSize:13}}>
+            Experiment <code>{runResult.experiment_id}</code> &nbsp;
+            baseline={fmt(runResult.baseline_brier,4)} → candidate={fmt(runResult.candidate_brier,4)} &nbsp;
+            <span className={runResult.improvement_pct > 0 ? 'pos' : 'neg'}>
+              {runResult.improvement_pct > 0 ? "+" : ""}{fmt(runResult.improvement_pct,1)}%
+            </span>
+            {runResult.promoted && <span className="tag promoted" style={{marginLeft:8}}>PROMOTED</span>}
+          </span>
+        )}
+        {runResult?.error && <span className="error-msg">{runResult.error}</span>}
+      </div>
       {/* Promotion candidates */}
       {candidates && candidates.length > 0 && (
         <div className="card" style={{border: '1px solid #3182ce'}}>
@@ -485,6 +578,7 @@ function App() {
         </span>
         <button className="refresh-btn" onClick={refresh}>↻ Refresh</button>
       </div>
+      <QuickStats />
       <div className="tabs">
         {tabs.map((t, i) => (
           <div key={i} className={`tab ${tab === i ? "active" : ""}`} onClick={() => setTab(i)}>

@@ -66,6 +66,52 @@ def prob_above_threshold(
     return temperature_scale(raw, temp_T)
 
 
+def dynamic_std_f(
+    city: str,
+    target_date: str,
+    model_spread: float,
+    lead_hours: float,
+    base_std_f: float,
+) -> float:
+    """
+    Compute dynamic forecast uncertainty (std-dev in °F).
+
+    Adjusts base_std_f upward for:
+      - High model spread (disagreement between models)
+      - Long lead time (more uncertainty farther out)
+      - Summer months in hot cities (higher temperature variance)
+
+    Args:
+        city:         City name (used for seasonal adjustment lookup).
+        target_date:  ISO date string "YYYY-MM-DD".
+        model_spread: Std-dev of model ensemble temperatures (°F).
+        lead_hours:   Hours between now and target settlement.
+        base_std_f:   Baseline std-dev from params.
+
+    Returns:
+        Adjusted std-dev in °F (always >= base_std_f).
+    """
+    std = base_std_f
+
+    # Lead-time scaling: add 0.5°F per 24h of lead beyond 24h, capped at +3°F
+    lead_days = max(0.0, (lead_hours - 24.0) / 24.0)
+    std += min(3.0, lead_days * 0.5)
+
+    # Model spread contribution: weight model disagreement into uncertainty
+    # Add 30% of the model spread on top
+    std += 0.3 * max(0.0, model_spread)
+
+    # Seasonal boost for summer (Jun-Aug) — higher variance
+    try:
+        month = int(target_date[5:7])
+        if 6 <= month <= 8:
+            std *= 1.15
+    except (ValueError, IndexError):
+        pass
+
+    return max(base_std_f, std)
+
+
 def brier_score(predicted: float, outcome: float) -> float:
     """Brier score for a single prediction. outcome ∈ {0.0, 1.0}."""
     return (predicted - outcome) ** 2

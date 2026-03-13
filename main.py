@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -78,6 +79,27 @@ def _fetch_markets() -> list:
     return markets
 
 
+def _persist_markets(markets: list, conn) -> None:
+    """Upsert fetched markets into the DB before signal generation."""
+    now = datetime.now(timezone.utc).isoformat()
+    for m in markets:
+        conn.execute(
+            """INSERT OR REPLACE INTO markets
+               (id, ticker, city, target_date, market_type, low_f, high_f,
+                exchange, status, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                m["id"], m["ticker"], m["city"], m["target_date"],
+                m.get("market_type", "above"),
+                m.get("low_f"), m.get("high_f"),
+                m.get("exchange", "kalshi"),
+                "open", now,
+            ),
+        )
+    conn.commit()
+    print(f"[main] persisted {len(markets)} market(s) to DB")
+
+
 def _fetch_forecasts(markets: list, conn) -> list:
     """Fetch weather forecasts for all unique (city, target_date) pairs."""
     from clients.weather import fetch_and_store
@@ -112,10 +134,21 @@ def run_once(paper: bool = True, live: bool = False) -> dict:
     migrate_from_json()
     startup_checks(conn)
 
-    brain = Brain(conn=conn, params=PARAMS, dry_run=dry_run)
+    from execution.exchange_executor import PaperExecutor, KalshiExecutor
+    if live:
+        try:
+            executor = KalshiExecutor()
+        except ValueError as exc:
+            print(f"[main] Cannot start live mode: {exc}", file=sys.stderr)
+            raise
+    else:
+        executor = PaperExecutor()
+
+    brain = Brain(conn=conn, params=PARAMS, dry_run=dry_run, executor=executor)
 
     if paper or live:
         markets = _fetch_markets()
+        _persist_markets(markets, conn)
         forecasts = _fetch_forecasts(markets, conn)
     else:
         markets = []
@@ -140,6 +173,22 @@ def _load_open_positions(conn) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _post_last_cycle(summary: dict, port: int = 5001) -> None:
+    """Push last-cycle summary to dashboard API (best-effort)."""
+    try:
+        import urllib.request, json as _json
+        data = _json.dumps(summary).encode()
+        req = urllib.request.Request(
+            f"http://localhost:{port}/api/last_cycle",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=1)
+    except Exception:
+        pass  # dashboard may not be running
+
+
 def autoloop(interval_seconds: int = 300, paper: bool = True, live: bool = False) -> None:
     mode = "live" if live else "paper"
     print(f"[main] Starting autoloop (interval={interval_seconds}s, mode={mode})")
@@ -151,6 +200,7 @@ def autoloop(interval_seconds: int = 300, paper: bool = True, live: bool = False
                 f"executable={summary['signals_executable']} "
                 f"executed={summary['executed']} exits={summary['exits']}"
             )
+            _post_last_cycle(summary)
         except Exception as exc:
             print(f"[main] cycle error: {exc}", file=sys.stderr)
         time.sleep(interval_seconds)

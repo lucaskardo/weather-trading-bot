@@ -36,6 +36,7 @@ class ModelReleaseStrategy(BaseStrategy):
         markets: list[dict[str, Any]],
         forecasts: list[ModelForecast],
         params: Params = PARAMS,
+        conn: Any = None,
     ) -> list[Signal]:
         signals: list[Signal] = []
 

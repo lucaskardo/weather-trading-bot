@@ -75,6 +75,7 @@ class BaseStrategy(abc.ABC):
         markets: list[dict[str, Any]],
         forecasts: list[Any],         # list[ModelForecast]
         params: Any,                  # Params
+        conn: Any = None,             # sqlite3.Connection, optional
     ) -> list[Signal]:
         """
         Scan markets + forecasts and return candidate signals.

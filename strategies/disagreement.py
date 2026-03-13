@@ -40,6 +40,7 @@ class DisagreementStrategy(BaseStrategy):
         markets: list[dict[str, Any]],
         forecasts: list[ModelForecast],
         params: Params = PARAMS,
+        conn: Any = None,
         model_accuracy: dict[str, dict[str, float]] | None = None,
         trade_counts: dict[str, dict[str, int]] | None = None,
     ) -> list[Signal]:

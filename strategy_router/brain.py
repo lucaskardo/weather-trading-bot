@@ -18,6 +18,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from execution.exchange_executor import ExchangeExecutor, PaperExecutor
 from execution.lifecycle import run_lifecycle_cycle, PositionStatus
 from shared.params import Params, PARAMS
 from shared.types import ModelForecast
@@ -52,10 +53,12 @@ class Brain:
         conn: sqlite3.Connection,
         params: Params = PARAMS,
         dry_run: bool = True,
+        executor: ExchangeExecutor | None = None,
     ):
         self.conn = conn
         self.params = params
         self.dry_run = dry_run
+        self.executor: ExchangeExecutor = executor or PaperExecutor()
         self.strategies = list(_ALL_STRATEGIES)
 
     def run_cycle(
@@ -86,7 +89,7 @@ class Brain:
         all_signals: list[Signal] = []
         for strategy in self.strategies:
             try:
-                sigs = strategy.generate_signals(markets, forecasts, self.params)
+                sigs = strategy.generate_signals(markets, forecasts, self.params, conn=self.conn)
                 all_signals.extend(sigs)
             except Exception as exc:
                 _log(f"[brain] {strategy.name}.generate_signals failed: {exc}")
@@ -174,9 +177,16 @@ class Brain:
         size_usd: float = order["size_usd"]
         now = datetime.now(timezone.utc).isoformat()
 
+        fill = self.executor.place_order(
+            ticker=sig.ticker,
+            side=sig.side,
+            size_usd=size_usd,
+            price=sig.executable_price,
+            dry_run=self.dry_run,
+        )
         _log(
-            f"[brain] PAPER TRADE  {sig.ticker}  {sig.side}  "
-            f"${size_usd:.2f} @ {sig.executable_price:.3f}  "
+            f"[brain] ORDER {fill['status']}  {sig.ticker}  {sig.side}  "
+            f"${size_usd:.2f} @ {fill['fill_price']:.3f}  "
             f"edge={sig.executable_edge:.3f}"
         )
 
@@ -198,15 +208,30 @@ class Brain:
             ),
         )
 
+        # Build full entry snapshot for post-trade analysis
+        import json as _json
+        entry_reason = _json.dumps({
+            "high_f": sig.high_f,
+            "low_f": sig.low_f,
+            "market_type": sig.market_type,
+            "consensus_f": sig.consensus_f,
+            "agreement": sig.agreement,
+            "n_models": sig.n_models,
+            "edge": sig.edge,
+            "executable_edge": sig.executable_edge,
+            "market_price": sig.market_price,
+            "fair_value": sig.fair_value,
+        })
+
         # Open position
         self.conn.execute(
             """INSERT INTO positions
-               (strategy_name, ticker, city, target_date,
-                side, entry_price, size_usd, status, opened_at)
-               VALUES (?,?,?,?,?,?,?,'OPENED',?)""",
+               (strategy_name, market_id, ticker, city, target_date,
+                side, entry_price, size_usd, status, entry_reason, opened_at)
+               VALUES (?,?,?,?,?,?,?,?,'OPENED',?,?)""",
             (
-                sig.strategy_name, sig.ticker, sig.city, sig.target_date,
-                sig.side, sig.executable_price, size_usd, now,
+                sig.strategy_name, sig.market_id, sig.ticker, sig.city, sig.target_date,
+                sig.side, sig.executable_price, size_usd, entry_reason, now,
             ),
         )
 

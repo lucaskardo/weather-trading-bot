@@ -18,6 +18,7 @@ import statistics
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from core.forecaster import dynamic_std_f
 from execution.orderbook import OrderbookLevel, get_executable_price
 from shared.params import Params, PARAMS
 from shared.types import ModelForecast
@@ -32,7 +33,12 @@ def _iso_now() -> str:
     return _now_utc().isoformat()
 
 
-def _build_consensus(forecasts: list[ModelForecast], city: str, target_date: str):
+def _build_consensus(
+    forecasts: list[ModelForecast],
+    city: str,
+    target_date: str,
+    bias_table: dict | None = None,
+):
     """Return (consensus_f, agreement_std, model_highs, n_models) for a city/date."""
     relevant = [
         f for f in forecasts
@@ -41,7 +47,15 @@ def _build_consensus(forecasts: list[ModelForecast], city: str, target_date: str
     if not relevant:
         return None, None, [], 0
 
-    highs = [f.predicted_high_f for f in relevant]
+    if bias_table:
+        from research.bias_correction import apply_bias
+        highs = [
+            apply_bias(f.predicted_high_f, city, f.model_name, bias_table)
+            for f in relevant
+        ]
+    else:
+        highs = [f.predicted_high_f for f in relevant]
+
     consensus = statistics.mean(highs)
     agreement = statistics.stdev(highs) if len(highs) > 1 else 0.0
     return consensus, agreement, highs, len(highs)
@@ -73,7 +87,14 @@ class ValueEntryStrategy(BaseStrategy):
         markets: list[dict[str, Any]],
         forecasts: list[ModelForecast],
         params: Params = PARAMS,
+        conn: Any = None,
     ) -> list[Signal]:
+        # Load bias table once per cycle if DB connection available
+        bias_table: dict | None = None
+        if conn is not None:
+            from research.bias_correction import learn_biases
+            bias_table = learn_biases(conn)
+
         signals: list[Signal] = []
 
         for market in markets:
@@ -88,13 +109,20 @@ class ValueEntryStrategy(BaseStrategy):
                 continue
 
             consensus_f, agreement, model_highs, n_models = _build_consensus(
-                forecasts, city, target_date
+                forecasts, city, target_date, bias_table=bias_table
             )
             if consensus_f is None or n_models == 0:
                 continue
 
-            # Probability estimate
-            std_f = params.base_std_f
+            # Dynamic uncertainty: adjust std_f for model spread + lead time
+            lead_hours = _hours_to_settlement(target_date) or 48.0
+            std_f = dynamic_std_f(
+                city=city,
+                target_date=target_date,
+                model_spread=agreement or 0.0,
+                lead_hours=lead_hours,
+                base_std_f=params.base_std_f,
+            )
             fair_value = _prob_above_threshold(consensus_f, high_f, std_f)
 
             # Apply temperature scaling

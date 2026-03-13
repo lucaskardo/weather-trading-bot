@@ -29,11 +29,20 @@ from shared.params import Params, PARAMS
 # Minimum Brier improvement (relative) required to promote a candidate
 PROMOTION_THRESHOLD = 0.05   # 5% improvement
 
-# Parameter search space: (min, max, step)
+# Parameter search space: {param_name: (min, max, step)}
 _SEARCH_SPACE: dict[str, tuple[float, float, float]] = {
-    "base_std_f": (2.5, 12.0, 0.5),
-    "temp_T":     (0.7, 1.8, 0.1),
+    "base_std_f":           (2.5, 12.0, 0.5),
+    "temp_T":               (0.7, 1.8, 0.1),
+    "min_executable_edge":  (0.02, 0.15, 0.01),
+    "max_kelly_fraction":   (0.05, 0.40, 0.05),
+    "stale_forecast_hours": (6.0, 48.0, 6.0),
 }
+
+# Parameter combos to test jointly (pairs that interact)
+_COMBO_PROPOSALS: list[list[str]] = [
+    ["base_std_f", "temp_T"],
+    ["min_executable_edge", "max_kelly_fraction"],
+]
 
 
 class ExperimentRegistry:
@@ -247,12 +256,37 @@ class ExperimentRegistry:
 
     def _propose_candidate(self) -> dict[str, float]:
         """
-        Generate a candidate parameter dict by perturbing one parameter.
+        Generate a candidate parameter dict by perturbing one or two parameters.
 
-        Picks the parameter whose last tested perturbation gave the most
-        improvement, or cycles round-robin if no history exists.
+        Every 5th experiment proposes a 2-parameter combo from _COMBO_PROPOSALS.
+        Otherwise picks the least-tested single parameter and perturbs it.
         """
-        # Find which params have been tested least
+        # Count total completed experiments to decide single vs combo
+        total_done = self.conn.execute(
+            "SELECT COUNT(*) FROM experiments WHERE status != 'pending'"
+        ).fetchone()[0]
+
+        if total_done % 5 == 4 and _COMBO_PROPOSALS:
+            # Propose a combo
+            combo_idx = (total_done // 5) % len(_COMBO_PROPOSALS)
+            combo_keys = _COMBO_PROPOSALS[combo_idx]
+            result: dict[str, float] = {}
+            for param_name in combo_keys:
+                if param_name not in _SEARCH_SPACE:
+                    continue
+                current_val = getattr(self.params, param_name, None)
+                if current_val is None:
+                    continue
+                low, high, step = _SEARCH_SPACE[param_name]
+                candidate = round(current_val + step, 6)
+                if candidate > high:
+                    candidate = round(current_val - step, 6)
+                if low <= candidate <= high:
+                    result[param_name] = candidate
+            if result:
+                return result
+
+        # Single-parameter perturbation
         tested_counts: dict[str, int] = {}
         rows = self.conn.execute(
             "SELECT params_json FROM experiments WHERE status != 'pending'"
@@ -274,13 +308,12 @@ class ExperimentRegistry:
         current_val = getattr(self.params, param_name)
         low, high, step = _SEARCH_SPACE[param_name]
 
-        # Try +step, then -step, then random within bounds
+        # Try +step, then -step, then midpoint
         for delta in [step, -step]:
             candidate = round(current_val + delta, 6)
             if low <= candidate <= high:
                 return {param_name: candidate}
 
-        # Fallback: midpoint of range
         return {param_name: round((low + high) / 2, 6)}
 
     def _describe(self, params: dict) -> str:

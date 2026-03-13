@@ -25,6 +25,9 @@ except ImportError:
     print("Flask not installed. Run: pip install flask", file=sys.stderr)
     sys.exit(1)
 
+# Last-cycle summary written by main.py via _write_last_cycle()
+_LAST_CYCLE: dict = {}
+
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
 
@@ -292,6 +295,71 @@ def model_agreement():
            ORDER BY target_date DESC, city
            LIMIT 100"""
     ))
+
+
+# --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Last-cycle panel + quick-stats
+# --------------------------------------------------------------------------- #
+
+@app.route("/api/last_cycle")
+def last_cycle():
+    return jsonify(_LAST_CYCLE)
+
+
+@app.route("/api/last_cycle", methods=["POST"])
+def update_last_cycle():
+    global _LAST_CYCLE
+    _LAST_CYCLE = request.get_json(force=True) or {}
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/quick_stats")
+def quick_stats():
+    portfolio = _one("SELECT * FROM portfolio WHERE id=1")
+    open_count = _one("SELECT COUNT(*) as n FROM positions WHERE status NOT IN "
+                      "('WON','LOST','EXITED_CONVERGENCE','EXITED_STOP','EXITED_PRE_SETTLEMENT')")
+    closed_count = _one("SELECT COUNT(*) as n FROM positions WHERE realized_pnl IS NOT NULL")
+    win_count = _one("SELECT COUNT(*) as n FROM positions WHERE realized_pnl > 0")
+    total_pnl = _one("SELECT SUM(realized_pnl) as total FROM positions WHERE realized_pnl IS NOT NULL")
+    exp_count = _one("SELECT COUNT(*) as n FROM experiments")
+    return jsonify({
+        "bankroll": portfolio.get("bankroll"),
+        "total_pnl": portfolio.get("total_pnl"),
+        "open_positions": open_count.get("n", 0),
+        "closed_positions": closed_count.get("n", 0),
+        "winning_positions": win_count.get("n", 0),
+        "win_rate": (
+            round(win_count.get("n", 0) / closed_count["n"], 3)
+            if closed_count.get("n") else None
+        ),
+        "realized_pnl": total_pnl.get("total"),
+        "experiments_run": exp_count.get("n", 0),
+        "last_cycle": _LAST_CYCLE,
+    })
+
+
+# --------------------------------------------------------------------------- #
+# Autoresearch trigger
+# --------------------------------------------------------------------------- #
+
+@app.route("/api/autoresearch/run", methods=["POST"])
+def run_autoresearch():
+    """Trigger one autoresearch experiment cycle from the dashboard."""
+    try:
+        from research.autoresearch import ExperimentRegistry
+        from research.calibrator import _build_trade_log
+        conn = _conn()
+        trade_log = _build_trade_log(conn)
+        if len(trade_log) < 6:
+            return jsonify({
+                "error": f"Not enough resolved trades ({len(trade_log)}) to run experiments"
+            }), 400
+        registry = ExperimentRegistry(conn, n_windows=5)
+        result = registry.run_cycle(trade_log)
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
 # --------------------------------------------------------------------------- #

@@ -39,6 +39,7 @@ class ConvergenceExitStrategy(BaseStrategy):
         markets: list[dict[str, Any]],
         forecasts: list[ModelForecast],
         params: Params = PARAMS,
+        conn: Any = None,
     ) -> list[Signal]:
         # Convergence exit doesn't generate entry signals
         return []
