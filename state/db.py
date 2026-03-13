@@ -176,6 +176,19 @@ def init_db(path: Path | None = None) -> sqlite3.Connection:
             PRIMARY KEY (city, target_date)
         );
 
+        CREATE TABLE IF NOT EXISTS experiments (
+            id            TEXT PRIMARY KEY,
+            description   TEXT,
+            params_json   TEXT NOT NULL,
+            baseline_brier  REAL,
+            candidate_brier REAL,
+            improvement_pct REAL,
+            trade_count   INTEGER,
+            status        TEXT NOT NULL DEFAULT 'pending',
+            created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at  TEXT
+        );
+
         INSERT OR IGNORE INTO portfolio (id, bankroll, cash_available, total_pnl)
         VALUES (1, 1000.0, 1000.0, 0.0);
     """)

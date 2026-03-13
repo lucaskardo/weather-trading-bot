@@ -5,6 +5,8 @@ Computes the true cost to execute a trade by walking the orderbook
 (if available) or falling back to mid-price + slippage + fees.
 
 All prices are in cents-per-dollar (0.0–1.0 probability space).
+
+Includes Kalshi's Feb 2026 price-dependent fee schedule.
 """
 
 from __future__ import annotations
@@ -13,6 +15,40 @@ from dataclasses import dataclass
 from typing import Optional
 
 from shared.params import PARAMS, Params
+
+
+# ---------------------------------------------------------------------------
+# Kalshi fee schedule (Feb 2026)
+# ---------------------------------------------------------------------------
+
+# Fee rate brackets: (max_price_cents_exclusive, fee_rate)
+# Fee per contract = min(price, 100-price) * fee_rate
+# Price here is YES price in cents (1–99).
+_KALSHI_FEE_BRACKETS: list[tuple[int, float]] = [
+    (10,  0.035),   # 1–9¢ and 91–99¢: 3.5%
+    (25,  0.050),   # 10–24¢ and 76–90¢: 5.0%
+    (51,  0.070),   # 25–50¢ (near 50 — most expensive): 7.0%
+]
+
+
+def kalshi_fee_rate(price: float) -> float:
+    """
+    Return Kalshi's taker fee rate for a contract at the given price (0-1).
+
+    Fee = min(price, 1-price) * rate, expressed as a fraction of notional.
+    Peak near 50¢ contracts, lower at extremes.
+    """
+    price_cents = round(price * 100)
+    price_cents = max(1, min(99, price_cents))
+    # Use the lower of the two sides (min(p, 1-p) in cents)
+    effective_cents = min(price_cents, 100 - price_cents)
+
+    for max_cents, rate in _KALSHI_FEE_BRACKETS:
+        if effective_cents < max_cents:
+            return effective_cents / 100.0 * rate
+
+    # Fallback (should not reach here given bracket coverage)
+    return effective_cents / 100.0 * 0.07
 
 
 @dataclass
@@ -59,7 +95,6 @@ def get_executable_price(
         ExecutionInfo with all cost components populated.
     """
     p = params or PARAMS
-    fee_rate = p.taker_fee_pct
     slippage_cents = p.slippage_buffer_cents / 100.0  # convert cents → fraction
     min_depth = p.min_depth_usd
 
@@ -70,15 +105,11 @@ def get_executable_price(
         depth = 0.0  # unknown depth when no orderbook provided
 
     # Slippage: add buffer on top of VWAP (buying costs more, selling costs less)
-    if side.upper() == "YES":
-        raw_exec = vwap + slippage_cents
-    else:
-        raw_exec = vwap + slippage_cents  # same for NO (buying NO contracts)
-
+    raw_exec = vwap + slippage_cents
     raw_exec = max(0.01, min(0.99, raw_exec))  # clamp to valid probability range
 
-    # Fees: taker fee applied to notional
-    fees_est = fee_rate  # expressed as fraction of notional per trade
+    # Fees: use Kalshi's price-dependent schedule (peaks near 50¢ contracts)
+    fees_est = kalshi_fee_rate(raw_exec)
 
     # Executable price = VWAP + slippage + fees
     executable_price = raw_exec + fees_est

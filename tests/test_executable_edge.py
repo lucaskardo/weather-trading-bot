@@ -124,9 +124,14 @@ class TestGetExecutablePrice:
         assert info.executable_price > 0.55
 
     def test_fees_included(self):
+        # Fee schedule is now price-dependent (Kalshi Feb 2026).
+        # At 0.55 price: effective_cents = min(55,45) = 45, bracket <51 → rate=7%
+        # fee = 45/100 * 0.07 = 0.0315
+        from execution.orderbook import kalshi_fee_rate
         p = default_params(taker_fee_pct=0.01, slippage_buffer_cents=0.0)
         info = get_executable_price("TKR", "YES", 100.0, 0.55, params=p)
-        assert info.fees_est == pytest.approx(0.01)
+        expected_fee = kalshi_fee_rate(0.55)
+        assert info.fees_est == pytest.approx(expected_fee)
 
     def test_slippage_included(self):
         p = default_params(taker_fee_pct=0.0, slippage_buffer_cents=2.0)
