@@ -470,7 +470,7 @@ class TestStartupChecks:
         db_module.DB_PATH = test_db
         try:
             from main import run_once
-            result = run_once(dry_run=True)
+            result = run_once(paper=False, live=False)
             assert "signals_generated" in result
         finally:
             db_module.DB_PATH = original_path

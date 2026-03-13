@@ -165,14 +165,57 @@ class Brain:
 
     def _execute_order(self, order: dict[str, Any]) -> None:
         """
-        Stub: send order to exchange API and record in DB.
-        Implemented properly when exchange clients are wired up.
+        Paper execution: log trade to predictions + positions tables and
+        deduct from portfolio bankroll. In live mode this would also call
+        the exchange API before writing to the DB.
         """
+        from datetime import datetime, timezone
         sig: Signal = order["signal"]
         size_usd: float = order["size_usd"]
-        _log(f"[brain] EXECUTE {sig.ticker} {sig.side} ${size_usd:.2f} @ {sig.executable_price:.3f}")
-        # TODO: call kalshi_client.place_order(sig.ticker, sig.side, size_usd)
-        # TODO: INSERT INTO positions (...)
+        now = datetime.now(timezone.utc).isoformat()
+
+        _log(
+            f"[brain] PAPER TRADE  {sig.ticker}  {sig.side}  "
+            f"${size_usd:.2f} @ {sig.executable_price:.3f}  "
+            f"edge={sig.executable_edge:.3f}"
+        )
+
+        # Record prediction
+        self.conn.execute(
+            """INSERT OR IGNORE INTO predictions
+               (strategy_name, ticker, city, target_date,
+                fair_value, market_price, executable_price,
+                edge, executable_edge, confidence,
+                consensus_f, agreement, n_models,
+                is_shadow, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)""",
+            (
+                sig.strategy_name, sig.ticker, sig.city, sig.target_date,
+                sig.fair_value, sig.market_price, sig.executable_price,
+                sig.edge, sig.executable_edge, sig.confidence,
+                sig.consensus_f, sig.agreement, sig.n_models,
+                now,
+            ),
+        )
+
+        # Open position
+        self.conn.execute(
+            """INSERT INTO positions
+               (strategy_name, ticker, city, target_date,
+                side, entry_price, size_usd, status, opened_at)
+               VALUES (?,?,?,?,?,?,?,'OPENED',?)""",
+            (
+                sig.strategy_name, sig.ticker, sig.city, sig.target_date,
+                sig.side, sig.executable_price, size_usd, now,
+            ),
+        )
+
+        # Deduct from bankroll
+        self.conn.execute(
+            "UPDATE portfolio SET bankroll = bankroll - ?, updated_at=? WHERE id=1",
+            (size_usd, now),
+        )
+        self.conn.commit()
 
 
 def _log(msg: str) -> None:

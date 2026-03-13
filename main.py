@@ -2,7 +2,14 @@
 Weather Trading Bot — main entry point.
 
 Runs one trading cycle (or loops on a schedule via autoloop).
-The Brain orchestrates everything; main.py handles startup checks + scheduling.
+The Brain orchestrates everything; main.py handles startup + data wiring.
+
+Usage:
+    python main.py --paper           # single paper cycle with real market data
+    python main.py --paper --loop    # continuous paper trading
+    python main.py --live --loop     # live trading (requires API keys)
+    python main.py --calibrate       # run calibration cycle
+    python main.py --dashboard       # start dashboard API server
 """
 
 from __future__ import annotations
@@ -11,7 +18,6 @@ import sys
 import time
 from pathlib import Path
 
-# Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).parent))
 
 from shared.params import PARAMS
@@ -21,29 +27,14 @@ from risk.reconciliation import reconcile_positions
 
 
 def startup_checks(conn) -> None:
-    """
-    Full startup validation before entering the main loop.
-
-    Spec requirements:
-      init_db()              — tables exist (called before startup_checks)
-      assert_db_integrity()  — PRAGMA integrity_check passes
-      reconcile_positions()  — sync local DB with exchange (uses empty list = no-op)
-      check_params_sanity()  — params are within safe bounds
-    """
     assert_db_integrity(conn)
     _reconcile_on_startup(conn)
     _check_params_sanity(PARAMS)
 
 
 def _reconcile_on_startup(conn) -> None:
-    """
-    Run reconciliation on startup with empty exchange list.
-    In production this would call the exchange API; here it's a no-op
-    that validates the local DB is internally consistent.
-    """
     result = reconcile_positions(conn, exchange_positions=[], auto_correct=False)
     if result.critical_count > 0:
-        import sys
         print(
             f"[startup] WARNING: {result.critical_count} critical reconciliation "
             f"discrepancies found. Review positions before trading.",
@@ -65,18 +56,72 @@ def _check_params_sanity(params) -> None:
     assert abs(weights - 1.0) < 1e-6, f"Router weights don't sum to 1: {weights}"
 
 
-def run_once(dry_run: bool = True) -> dict:
-    """Run a single trading cycle. Returns brain cycle summary."""
+def _fetch_markets() -> list:
+    """Fetch markets from Kalshi and Polymarket. Returns empty list on error."""
+    markets = []
+    try:
+        from clients.kalshi_client import fetch_all_weather_markets as fetch_kalshi
+        km = fetch_kalshi()
+        markets.extend(km)
+        print(f"[main] kalshi: {len(km)} markets fetched")
+    except Exception as exc:
+        print(f"[main] kalshi fetch error: {exc}", file=sys.stderr)
+
+    try:
+        from clients.polymarket_client import fetch_all_weather_markets as fetch_poly
+        pm = fetch_poly()
+        markets.extend(pm)
+        print(f"[main] polymarket: {len(pm)} markets fetched")
+    except Exception as exc:
+        print(f"[main] polymarket fetch error: {exc}", file=sys.stderr)
+
+    return markets
+
+
+def _fetch_forecasts(markets: list, conn) -> list:
+    """Fetch weather forecasts for all unique (city, target_date) pairs."""
+    from clients.weather import fetch_and_store
+
+    forecasts = []
+    seen: set = set()
+    for m in markets:
+        key = (m.get("city"), m.get("target_date"))
+        if None in key or key in seen:
+            continue
+        seen.add(key)
+        try:
+            city_forecasts = fetch_and_store(m["city"], m["target_date"], conn)
+            forecasts.extend(city_forecasts)
+        except Exception as exc:
+            print(f"[main] forecast error for {key}: {exc}", file=sys.stderr)
+
+    print(f"[main] {len(forecasts)} forecast(s) for {len(seen)} city/date pair(s)")
+    return forecasts
+
+
+def run_once(paper: bool = True, live: bool = False) -> dict:
+    """
+    Run a single trading cycle.
+
+    paper=True  → fetch real market data, execute paper trades (log to DB only)
+    live=True   → fetch real data AND place real exchange orders
+    """
+    dry_run = not live
+
     conn = init_db()
-    migrate_from_json()   # no-op if state_legacy/ doesn't exist
+    migrate_from_json()
     startup_checks(conn)
 
     brain = Brain(conn=conn, params=PARAMS, dry_run=dry_run)
 
-    # In production these come from exchange APIs + weather client
-    markets: list = []
-    forecasts: list = []
-    open_positions: list = _load_open_positions(conn)
+    if paper or live:
+        markets = _fetch_markets()
+        forecasts = _fetch_forecasts(markets, conn)
+    else:
+        markets = []
+        forecasts = []
+
+    open_positions = _load_open_positions(conn)
 
     summary = brain.run_cycle(
         markets=markets,
@@ -95,32 +140,67 @@ def _load_open_positions(conn) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def autoloop(interval_seconds: int = 300, dry_run: bool = True) -> None:
-    """Run trading cycles on a fixed interval (default every 5 minutes)."""
-    print(f"[main] Starting autoloop (interval={interval_seconds}s, dry_run={dry_run})")
+def autoloop(interval_seconds: int = 300, paper: bool = True, live: bool = False) -> None:
+    mode = "live" if live else "paper"
+    print(f"[main] Starting autoloop (interval={interval_seconds}s, mode={mode})")
     while True:
         try:
-            summary = run_once(dry_run=dry_run)
+            summary = run_once(paper=paper, live=live)
             print(
                 f"[main] cycle complete — signals={summary['signals_generated']} "
-                f"exec={summary['executed']} exits={summary['exits']}"
+                f"executable={summary['signals_executable']} "
+                f"executed={summary['executed']} exits={summary['exits']}"
             )
         except Exception as exc:
             print(f"[main] cycle error: {exc}", file=sys.stderr)
         time.sleep(interval_seconds)
 
 
+def run_calibrate() -> None:
+    """Run the calibration pipeline."""
+    from research.calibrator import run_calibration
+    conn = init_db()
+    result = run_calibration(conn, PARAMS)
+    print(f"[calibrate] done: {result}")
+
+
+def run_dashboard() -> None:
+    """Start the dashboard API server."""
+    try:
+        import dashboard.api as api
+        api.run()
+    except ImportError:
+        print("[dashboard] dashboard/api.py not found. Run Phase C setup first.")
+
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Weather Trading Bot")
-    parser.add_argument("--live", action="store_true", help="Execute real trades (default: dry-run)")
-    parser.add_argument("--loop", action="store_true", help="Run in continuous loop")
-    parser.add_argument("--interval", type=int, default=300, help="Loop interval in seconds")
+    parser.add_argument("--paper", action="store_true",
+                        help="Paper trade with real market data (default mode)")
+    parser.add_argument("--live", action="store_true",
+                        help="Execute real trades (requires API keys)")
+    parser.add_argument("--loop", action="store_true",
+                        help="Run in continuous loop")
+    parser.add_argument("--interval", type=int, default=300,
+                        help="Loop interval in seconds (default: 300)")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Run calibration cycle and exit")
+    parser.add_argument("--dashboard", action="store_true",
+                        help="Start dashboard API server")
     args = parser.parse_args()
 
-    if args.loop:
-        autoloop(interval_seconds=args.interval, dry_run=not args.live)
+    if args.dashboard:
+        run_dashboard()
+    elif args.calibrate:
+        run_calibrate()
+    elif args.loop:
+        autoloop(
+            interval_seconds=args.interval,
+            paper=args.paper or not args.live,
+            live=args.live,
+        )
     else:
-        result = run_once(dry_run=not args.live)
+        result = run_once(paper=args.paper or not args.live, live=args.live)
         print(result)

@@ -1,0 +1,5 @@
+requests>=2.31
+python-dotenv>=1.0
+numpy>=1.26
+scipy>=1.12
+flask>=3.0
