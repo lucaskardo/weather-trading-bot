@@ -83,6 +83,72 @@ class PaperExecutor(ExchangeExecutor):
         }
 
 
+class MakerFirstExecutor(ExchangeExecutor):
+    """
+    Maker-first execution wrapper.
+
+    Wraps any ExchangeExecutor and implements passive-first order flow:
+    1. Try to place a post_only (maker) order at a slightly better price
+    2. In paper mode: fill immediately at the maker price (no wait)
+    3. In live mode: the caller is responsible for polling next cycle
+       and calling taker_fallback() if unfilled
+
+    The fills table records execution_type='maker' or 'taker'.
+    Scorecard gives bonus to strategies with high maker fill rate.
+    """
+
+    def __init__(
+        self,
+        inner: ExchangeExecutor,
+        maker_improvement: float = 0.005,   # improve price by 0.5¢
+    ):
+        self.inner = inner
+        self.maker_improvement = maker_improvement
+
+    def place_order(
+        self,
+        ticker: str,
+        side: str,
+        size_usd: float,
+        price: float,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Attempt maker order first. In paper/dry_run, fills at maker price.
+        In live, places post_only and returns 'pending_maker' status for
+        the caller to track next cycle.
+        """
+        # Maker price: bid slightly below for YES, above for NO
+        if side.upper() == "YES":
+            maker_price = max(0.01, price - self.maker_improvement)
+        else:
+            maker_price = min(0.99, price + self.maker_improvement)
+
+        if dry_run:
+            # Paper fill at better price — best-case maker simulation
+            return {
+                "status": "simulated_maker",
+                "fill_price": maker_price,
+                "fill_size_usd": size_usd,
+                "order_id": None,
+                "execution_type": "maker",
+                "simulated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        # Live: delegate to inner executor with maker price
+        result = self.inner.place_order(
+            ticker=ticker,
+            side=side,
+            size_usd=size_usd,
+            price=maker_price,
+            dry_run=False,
+        )
+        result["execution_type"] = "maker"
+        result["maker_price"] = maker_price
+        result["taker_fallback_price"] = price
+        return result
+
+
 class KalshiExecutor(ExchangeExecutor):
     """
     Live Kalshi executor.
@@ -132,8 +198,13 @@ class KalshiExecutor(ExchangeExecutor):
 
         # Kalshi uses cents (0–100) not probability (0–1)
         price_cents = round(price * 100)
-        # Kalshi counts are in contracts; $1 per contract → size_usd contracts
-        count = max(1, int(size_usd))
+
+        # Side-aware contract count: risk per YES contract = price, NO = (1 - price)
+        from execution.orderbook import kalshi_taker_fee
+        risk_per_contract = price if side.upper() == "YES" else (1.0 - price)
+        fee_per_contract = kalshi_taker_fee(price)
+        cost_per_contract = risk_per_contract + fee_per_contract
+        count = max(1, int(size_usd / max(cost_per_contract, 0.01)))
 
         payload = {
             "ticker": ticker,

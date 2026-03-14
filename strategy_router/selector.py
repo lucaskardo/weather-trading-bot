@@ -108,23 +108,26 @@ def _kelly_size(sig: Signal, budget: float, params: Params) -> float:
     """
     Fractional Kelly position size.
 
-    For a binary bet with edge e and win probability p:
-      kelly_f = (p * (1/cost - 1) - (1-p)) / (1/cost - 1)
-      simplified for small positions: kelly_f ≈ edge / (1 - price)
+    Uses effective_prob (win probability for OUR side, YES or NO) and
+    effective_price (cost of OUR side after fees) so NO bets size correctly.
+
+    kelly_f = (p * odds - q) / odds   where odds = (1 - price) / price
 
     Clamp to [min_kelly_fraction, max_kelly_fraction] of budget.
     """
-    edge = sig.executable_edge
-    price = sig.executable_price
-    if price <= 0 or price >= 1 or edge <= 0:
+    p = sig.effective_prob
+    price = sig.effective_price
+    if price <= 0 or price >= 1 or p <= 0:
         return 0.0
 
-    odds = (1.0 - price) / price  # net odds per dollar risked
-    p = sig.fair_value
     q = 1.0 - p
+    odds = (1.0 - price) / price   # net odds per dollar risked
     kelly_f = (p * odds - q) / odds if odds > 0 else 0.0
 
-    # Fractional Kelly (half Kelly is common)
+    if kelly_f <= 0:
+        return 0.0  # Kelly says don't bet — skip regardless of min fraction
+
+    # Fractional Kelly (half Kelly)
     kelly_f = kelly_f * 0.5
 
     kelly_f = max(params.min_kelly_fraction, min(params.max_kelly_fraction, kelly_f))

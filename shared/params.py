@@ -53,6 +53,12 @@ class Params:
     min_confidence: float = 0.0          # minimum model confidence to signal
     min_kelly_fraction: float = 0.01     # skip bets below 1% Kelly
     max_kelly_fraction: float = 0.25     # cap at 25% Kelly
+    use_monte_carlo: bool = True         # use MC probability engine vs Gaussian CDF
+    monte_carlo_samples: int = 2000      # MC samples per probability estimate
+    # Time-decaying edge threshold: min_edge = base_edge + alpha * exp(beta * hours_to_settlement)
+    # At 48h: base_edge + alpha * exp(48 * beta); at 2h: base_edge + alpha * exp(2 * beta)
+    edge_decay_alpha: float = 0.002      # additional edge required at max lead (72h+)
+    edge_decay_beta: float = 0.05        # decay exponent (controls shape of falloff)
 
     # ------------------------------------------------------------------ #
     # Cluster definitions

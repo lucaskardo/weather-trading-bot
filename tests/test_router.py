@@ -69,6 +69,11 @@ def _signal(
     is_shadow=False,
     side="YES",
 ) -> Signal:
+    exec_price = market_price + 0.02
+    # Effective (side-aware) values
+    eff_prob = fair_value if side == "YES" else (1.0 - fair_value)
+    eff_price = exec_price
+    eff_edge = eff_prob - eff_price
     return Signal(
         strategy_name=strategy,
         market_id=ticker,
@@ -78,9 +83,12 @@ def _signal(
         target_date="2026-06-01",
         market_price=market_price,
         fair_value=fair_value,
-        executable_price=market_price + 0.02,
+        executable_price=exec_price,
         edge=edge,
         executable_edge=edge,
+        effective_prob=eff_prob,
+        effective_price=eff_price,
+        effective_edge=eff_edge,
         confidence=confidence,
         is_shadow=is_shadow,
         side=side,

@@ -140,6 +140,8 @@ def process_position(
     entry_price = position.get("entry_price", 0.5)
     current_price = position.get("current_price", entry_price)
     high_f = position.get("high_f")
+    low_f = position.get("low_f")
+    market_type = position.get("market_type", "above")
 
     # Promote OPENED → HOLDING on first cycle
     if status == PositionStatus.OPENED:
@@ -154,7 +156,9 @@ def process_position(
         )
 
     # --- Compute updated edge from latest forecasts ---
-    updated_fair_value = _compute_fair_value(forecasts, city, target_date, high_f, params)
+    updated_fair_value = _compute_fair_value(
+        forecasts, city, target_date, high_f, params, market_type, low_f
+    )
 
     # --- Exit Rule 1: Stale forecast (check before trusting forecast values) ---
     if _is_forecast_stale(forecasts, city, target_date, params.stale_forecast_hours):
@@ -272,22 +276,24 @@ def _compute_fair_value(
     target_date: str,
     high_f: Optional[float],
     params: Params,
+    market_type: str = "above",
+    low_f: Optional[float] = None,
 ) -> Optional[float]:
-    import math
     import statistics as st
+    from strategies.value_entry import _compute_fair_value_for_market
 
     relevant = [
         f for f in forecasts
         if f.city == city and f.target_date == target_date
     ]
-    if not relevant or high_f is None:
+    if not relevant:
         return None
 
     highs = [f.predicted_high_f for f in relevant]
     consensus = st.mean(highs)
     std = params.base_std_f
-    z = (high_f - consensus) / (std * math.sqrt(2))
-    return 0.5 * math.erfc(z)
+
+    return _compute_fair_value_for_market(consensus, market_type, high_f, low_f, std)
 
 
 def _is_forecast_stale(

@@ -38,6 +38,11 @@ class Signal:
     executable_edge: float = 0.0   # after fees/slippage
     confidence: float = 0.0
 
+    # --- Effective (side-aware) values for Kelly and risk ---
+    effective_prob: float = 0.5      # win probability for OUR side (YES or NO)
+    effective_price: float = 0.5     # cost of OUR side after fees
+    effective_edge: float = 0.0      # effective_prob - effective_price
+
     # --- Context ---
     consensus_f: Optional[float] = None
     agreement: Optional[float] = None   # std-dev of model temps (lower = better)

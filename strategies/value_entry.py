@@ -38,6 +38,8 @@ def _build_consensus(
     city: str,
     target_date: str,
     bias_table: dict | None = None,
+    fine_bias_table: dict | None = None,
+    lead_hours: float = 48.0,
 ):
     """Return (consensus_f, agreement_std, model_highs, n_models) for a city/date."""
     relevant = [
@@ -50,7 +52,12 @@ def _build_consensus(
     if bias_table:
         from research.bias_correction import apply_bias
         highs = [
-            apply_bias(f.predicted_high_f, city, f.model_name, bias_table)
+            apply_bias(
+                f.predicted_high_f, city, f.model_name, bias_table,
+                fine_bias_table=fine_bias_table,
+                target_date=target_date,
+                lead_hours=lead_hours,
+            )
             for f in relevant
         ]
     else:
@@ -72,6 +79,46 @@ def _prob_above_threshold(consensus_f: float, threshold_f: float, std_f: float) 
     return 0.5 * math.erfc(z)
 
 
+def _compute_fair_value_for_market(
+    consensus_f: float,
+    market_type: str,
+    high_f: float | None,
+    low_f: float | None,
+    std_f: float,
+) -> float | None:
+    """
+    Compute P(YES) for any market type using Gaussian CDF.
+
+    above: P(actual >= high_f)  — uses half-degree rounding for integer settlement
+    below: P(actual <= high_f)  — uses half-degree rounding
+    band:  P(low_f <= actual <= high_f) = CDF(high_f + 0.5) - CDF(low_f - 0.5)
+    """
+    if std_f <= 0:
+        return None
+
+    def cdf(x: float) -> float:
+        """P(X <= x) under N(consensus_f, std_f^2)."""
+        z = (x - consensus_f) / (std_f * math.sqrt(2))
+        return 0.5 * (1.0 + math.erf(z))
+
+    mtype = (market_type or "above").lower()
+
+    if mtype == "band":
+        if low_f is None or high_f is None:
+            return None
+        prob = cdf(high_f + 0.5) - cdf(low_f - 0.5)
+    elif mtype == "below":
+        if high_f is None:
+            return None
+        prob = cdf(high_f + 0.5)
+    else:  # "above" (default)
+        if high_f is None:
+            return None
+        prob = 1.0 - cdf(high_f - 0.5)
+
+    return max(0.01, min(0.99, prob))
+
+
 class ValueEntryStrategy(BaseStrategy):
     """
     Enter positions where executable edge >= min_executable_edge.
@@ -89,11 +136,13 @@ class ValueEntryStrategy(BaseStrategy):
         params: Params = PARAMS,
         conn: Any = None,
     ) -> list[Signal]:
-        # Load bias table once per cycle if DB connection available
+        # Load bias tables once per cycle if DB connection available
         bias_table: dict | None = None
+        fine_bias_table: dict | None = None
         if conn is not None:
-            from research.bias_correction import learn_biases
+            from research.bias_correction import learn_biases, learn_fine_biases
             bias_table = learn_biases(conn)
+            fine_bias_table = learn_fine_biases(conn)
 
         signals: list[Signal] = []
 
@@ -109,7 +158,10 @@ class ValueEntryStrategy(BaseStrategy):
                 continue
 
             consensus_f, agreement, model_highs, n_models = _build_consensus(
-                forecasts, city, target_date, bias_table=bias_table
+                forecasts, city, target_date,
+                bias_table=bias_table,
+                fine_bias_table=fine_bias_table,
+                lead_hours=_hours_to_settlement(target_date) or 48.0,
             )
             if consensus_f is None or n_models == 0:
                 continue
@@ -123,7 +175,24 @@ class ValueEntryStrategy(BaseStrategy):
                 lead_hours=lead_hours,
                 base_std_f=params.base_std_f,
             )
-            fair_value = _prob_above_threshold(consensus_f, high_f, std_f)
+            # Correct probability per market type (band / below / above)
+            market_type = market.get("market_type", "above")
+            if getattr(params, "use_monte_carlo", True) and model_highs:
+                from core.forecaster import monte_carlo_prob
+                fair_value = monte_carlo_prob(
+                    model_forecasts=model_highs,
+                    market_type=market_type,
+                    high_f=high_f,
+                    low_f=low_f,
+                    sigma=std_f,
+                    n_samples=getattr(params, "monte_carlo_samples", 2000),
+                )
+            else:
+                fair_value = _compute_fair_value_for_market(
+                    consensus_f, market_type, high_f, low_f, std_f
+                )
+                if fair_value is None:
+                    continue
 
             # Apply temperature scaling
             T = params.temp_scaling_T
@@ -163,7 +232,13 @@ class ValueEntryStrategy(BaseStrategy):
 
             executable_edge = eff_model_prob - exec_info.executable_price
 
-            if executable_edge < params.min_executable_edge:
+            # Time-decaying edge threshold: require less edge near settlement
+            # Cap lead_hours at 72h so distant contracts get max (not runaway) threshold
+            alpha = getattr(params, "edge_decay_alpha", 0.002)
+            beta = getattr(params, "edge_decay_beta", 0.05)
+            capped_hours = min(lead_hours, 72.0)
+            dynamic_min_edge = params.min_executable_edge + alpha * math.exp(beta * capped_hours)
+            if executable_edge < dynamic_min_edge:
                 continue
             if not exec_info.is_liquid:
                 continue
@@ -176,7 +251,7 @@ class ValueEntryStrategy(BaseStrategy):
                 source=market.get("exchange", "kalshi"),
                 city=city,
                 target_date=target_date,
-                market_type=market.get("market_type", "high_temp"),
+                market_type=market.get("market_type", "above"),
                 low_f=low_f,
                 high_f=high_f,
                 market_price=market_price,
@@ -184,6 +259,10 @@ class ValueEntryStrategy(BaseStrategy):
                 executable_price=exec_info.executable_price,
                 edge=raw_edge,
                 executable_edge=executable_edge,
+                # Side-aware effective values for correct Kelly sizing
+                effective_prob=eff_model_prob,
+                effective_price=exec_info.executable_price,
+                effective_edge=executable_edge,
                 confidence=confidence,
                 consensus_f=consensus_f,
                 agreement=agreement,

@@ -117,6 +117,10 @@ def init_db(path: Path | None = None) -> sqlite3.Connection:
             ticker            TEXT NOT NULL,
             city              TEXT NOT NULL,
             target_date       TEXT NOT NULL,
+            high_f            REAL,
+            low_f             REAL,
+            market_type       TEXT,
+            exchange          TEXT,
             side              TEXT NOT NULL,
             size_usd          REAL NOT NULL,
             entry_price       REAL NOT NULL,
@@ -132,6 +136,31 @@ def init_db(path: Path | None = None) -> sqlite3.Connection:
             opened_at         TEXT NOT NULL DEFAULT (datetime('now')),
             closed_at         TEXT,
             updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS orders (
+            id                TEXT PRIMARY KEY,
+            position_id       INTEGER REFERENCES positions(id),
+            ticker            TEXT NOT NULL,
+            side              TEXT NOT NULL,
+            order_type        TEXT NOT NULL DEFAULT 'limit',
+            requested_price   REAL NOT NULL,
+            requested_count   INTEGER NOT NULL,
+            status            TEXT NOT NULL DEFAULT 'pending',
+            exchange_order_id TEXT,
+            created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS fills (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id          TEXT REFERENCES orders(id),
+            position_id       INTEGER REFERENCES positions(id),
+            fill_price        REAL NOT NULL,
+            fill_count        INTEGER NOT NULL,
+            fees_paid         REAL NOT NULL DEFAULT 0.0,
+            execution_type    TEXT DEFAULT 'taker',
+            filled_at         TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
         CREATE TABLE IF NOT EXISTS portfolio (
@@ -193,7 +222,36 @@ def init_db(path: Path | None = None) -> sqlite3.Connection:
         VALUES (1, 1000.0, 1000.0, 0.0);
     """)
     conn.commit()
+    _migrate_schema(conn)
     return conn
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """
+    Apply incremental schema migrations for existing databases.
+    Uses ALTER TABLE ADD COLUMN which is a no-op if column already exists
+    (wrapped in try/except for SQLite compatibility).
+    """
+    _add_column_if_missing(conn, "positions", "high_f", "REAL")
+    _add_column_if_missing(conn, "positions", "low_f", "REAL")
+    _add_column_if_missing(conn, "positions", "market_type", "TEXT")
+    _add_column_if_missing(conn, "positions", "exchange", "TEXT")
+    conn.commit()
+
+
+def _add_column_if_missing(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    col_type: str,
+) -> None:
+    """Add a column to a table if it doesn't already exist."""
+    existing = {
+        row[1]
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
 
 
 def assert_db_integrity(conn: sqlite3.Connection | None = None) -> None:

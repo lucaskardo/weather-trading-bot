@@ -112,6 +112,68 @@ def dynamic_std_f(
     return max(base_std_f, std)
 
 
+def monte_carlo_prob(
+    model_forecasts: list[float],
+    market_type: str,
+    high_f: float | None,
+    low_f: float | None,
+    sigma: float,
+    n_samples: int = 2000,
+    seed: int | None = None,
+) -> float:
+    """
+    Estimate P(YES) via Monte Carlo sampling from the model ensemble.
+
+    For each model forecast, draw n_samples/n_models samples from
+    N(forecast, sigma²). Count samples satisfying the contract condition.
+    Uses dynamic sigma (from dynamic_std_f) which already accounts for
+    model spread, lead time, and season — no additional adjustments needed.
+
+    Args:
+        model_forecasts: List of raw (bias-corrected) model temperature forecasts.
+        market_type:     "above" | "below" | "band".
+        high_f:          Upper threshold (°F).
+        low_f:           Lower threshold for band contracts (°F).
+        sigma:           Per-model forecast std-dev (from dynamic_std_f).
+        n_samples:       Total samples across all models.
+        seed:            Random seed for reproducibility (None = random).
+
+    Returns:
+        Probability in [0.01, 0.99].
+    """
+    if not model_forecasts:
+        return 0.5
+
+    import random
+    rng = random.Random(seed)
+    n_models = len(model_forecasts)
+    per_model = max(1, n_samples // n_models)
+
+    hits = 0
+    total = 0
+    mtype = (market_type or "above").lower()
+
+    for mu in model_forecasts:
+        for _ in range(per_model):
+            x = rng.gauss(mu, sigma)
+            total += 1
+            if mtype == "band":
+                if low_f is not None and high_f is not None:
+                    if low_f <= x <= high_f:
+                        hits += 1
+            elif mtype == "below":
+                if high_f is not None and x <= high_f:
+                    hits += 1
+            else:  # above
+                if high_f is not None and x >= high_f:
+                    hits += 1
+
+    if total == 0:
+        return 0.5
+    prob = hits / total
+    return max(0.01, min(0.99, prob))
+
+
 def brier_score(predicted: float, outcome: float) -> float:
     """Brier score for a single prediction. outcome ∈ {0.0, 1.0}."""
     return (predicted - outcome) ** 2

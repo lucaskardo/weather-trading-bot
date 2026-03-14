@@ -18,37 +18,33 @@ from shared.params import PARAMS, Params
 
 
 # ---------------------------------------------------------------------------
-# Kalshi fee schedule (Feb 2026)
+# Kalshi fee schedule (Feb 2026 official formula)
 # ---------------------------------------------------------------------------
 
-# Fee rate brackets: (max_price_cents_exclusive, fee_rate)
-# Fee per contract = min(price, 100-price) * fee_rate
-# Price here is YES price in cents (1–99).
-_KALSHI_FEE_BRACKETS: list[tuple[int, float]] = [
-    (10,  0.035),   # 1–9¢ and 91–99¢: 3.5%
-    (25,  0.050),   # 10–24¢ and 76–90¢: 5.0%
-    (51,  0.070),   # 25–50¢ (near 50 — most expensive): 7.0%
-]
+def kalshi_taker_fee(price: float) -> float:
+    """
+    Kalshi Feb 2026 taker fee per contract.
+    Official formula: fee = 0.07 * P * (1 - P)
+    where P = contract price as probability (0–1).
+    Returns fee as a fraction of $1 contract value.
+
+    At 50¢: 0.07 * 0.5 * 0.5 = 0.0175 (1.75¢)
+    At 10¢: 0.07 * 0.1 * 0.9 = 0.0063 (0.63¢)
+    At  5¢: 0.07 * 0.05 * 0.95 = 0.0033 (0.33¢)
+    """
+    p = max(0.01, min(0.99, price))
+    return 0.07 * p * (1.0 - p)
 
 
+def kalshi_maker_fee(price: float) -> float:
+    """Maker fee is 1/4 of taker fee."""
+    return kalshi_taker_fee(price) * 0.25
+
+
+# Pipeline alias — backwards compatible
 def kalshi_fee_rate(price: float) -> float:
-    """
-    Return Kalshi's taker fee rate for a contract at the given price (0-1).
-
-    Fee = min(price, 1-price) * rate, expressed as a fraction of notional.
-    Peak near 50¢ contracts, lower at extremes.
-    """
-    price_cents = round(price * 100)
-    price_cents = max(1, min(99, price_cents))
-    # Use the lower of the two sides (min(p, 1-p) in cents)
-    effective_cents = min(price_cents, 100 - price_cents)
-
-    for max_cents, rate in _KALSHI_FEE_BRACKETS:
-        if effective_cents < max_cents:
-            return effective_cents / 100.0 * rate
-
-    # Fallback (should not reach here given bracket coverage)
-    return effective_cents / 100.0 * 0.07
+    """Alias for kalshi_taker_fee (used in executable price calculation)."""
+    return kalshi_taker_fee(price)
 
 
 @dataclass

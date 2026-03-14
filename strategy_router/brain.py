@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 from execution.exchange_executor import ExchangeExecutor, PaperExecutor
 from execution.lifecycle import run_lifecycle_cycle, PositionStatus
+from risk.guards import check_daily_loss_limit, DailyLossHalt
 from shared.params import Params, PARAMS
 from shared.types import ModelForecast
 from strategies.base import Signal
@@ -84,6 +85,30 @@ class Brain:
         now = datetime.now(timezone.utc).isoformat()
 
         # ------------------------------------------------------------------ #
+        # Step 0: Hard risk checks — halt entire cycle if limit breached
+        # ------------------------------------------------------------------ #
+        bankroll_check = self._get_bankroll()
+        try:
+            check_daily_loss_limit(self.conn, positions, bankroll_check)
+        except DailyLossHalt as exc:
+            _log(f"[brain] HALT: {exc}")
+            return {
+                "cycle_at": now,
+                "signals_generated": 0,
+                "signals_executable": 0,
+                "signals_shadow": 0,
+                "signals_filtered": 0,
+                "exits": 0,
+                "scores": {},
+                "allocations": {},
+                "orders": [],
+                "executed": 0,
+                "dry_run": self.dry_run,
+                "halted": True,
+                "halt_reason": str(exc),
+            }
+
+        # ------------------------------------------------------------------ #
         # Step 1: Generate signals from all strategies
         # ------------------------------------------------------------------ #
         all_signals: list[Signal] = []
@@ -102,6 +127,12 @@ class Brain:
         )
         exits = [a for a in lifecycle_actions if a.should_execute]
         _log(f"[brain] {len(exits)} exit(s) triggered this cycle")
+
+        # ------------------------------------------------------------------ #
+        # Step 2b: Persist exits — update status, compute PnL, return capital
+        # ------------------------------------------------------------------ #
+        for action in exits:
+            self._process_exit(action, positions)
 
         # ------------------------------------------------------------------ #
         # Step 3: Score strategies
@@ -166,6 +197,84 @@ class Brain:
         ).fetchone()
         return float(row["bankroll"]) if row else 1000.0
 
+    def _process_exit(self, action, positions: list[dict[str, Any]]) -> None:
+        """
+        Persist an exit lifecycle action:
+          - Update position status and exit fields
+          - Compute realized PnL
+          - Return capital to bankroll
+          - Record in daily_pnl
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        today = now[:10]
+
+        # Find the position dict for PnL calculation
+        pos = next((p for p in positions if p.get("id") == action.position_id), None)
+        if pos is None:
+            return
+
+        exit_price = action.exit_price or pos.get("current_price") or pos.get("entry_price", 0.5)
+        entry_price = pos.get("entry_price", 0.5)
+        size_usd = pos.get("size_usd", 0.0)
+        side = pos.get("side", "YES")
+
+        if action.next_status.value in ("WON", "LOST"):
+            # Settlement: WON returns $1/contract (full notional), LOST returns $0
+            if action.next_status.value == "WON":
+                realized_pnl = size_usd * (1.0 / max(entry_price, 0.01) - 1.0)
+            else:
+                realized_pnl = -size_usd
+        else:
+            # Mid-trade exit: PnL based on price move
+            if side == "YES":
+                realized_pnl = (exit_price - entry_price) * size_usd / max(entry_price, 0.01)
+            else:
+                realized_pnl = (entry_price - exit_price) * size_usd / max(1.0 - entry_price, 0.01)
+
+        opened_at = pos.get("opened_at", now)
+        try:
+            hold_hours = (
+                datetime.fromisoformat(now) - datetime.fromisoformat(opened_at)
+            ).total_seconds() / 3600
+        except Exception:
+            hold_hours = 0.0
+
+        self.conn.execute(
+            """UPDATE positions
+               SET status=?, exit_price=?, exit_reason=?,
+                   realized_pnl=?, hold_time_hours=?, closed_at=?, updated_at=?
+               WHERE id=?""",
+            (
+                action.next_status.value, exit_price, action.reason,
+                realized_pnl, hold_hours, now, now,
+                action.position_id,
+            ),
+        )
+
+        # Return capital (size_usd) + PnL to bankroll
+        returned = size_usd + realized_pnl
+        self.conn.execute(
+            "UPDATE portfolio SET bankroll = bankroll + ?, updated_at=? WHERE id=1",
+            (returned, now),
+        )
+
+        # Log to daily_pnl
+        self.conn.execute(
+            """INSERT INTO daily_pnl (date, realized_pnl, num_trades, num_wins)
+               VALUES (?, ?, 1, ?)
+               ON CONFLICT(date) DO UPDATE SET
+                 realized_pnl = realized_pnl + excluded.realized_pnl,
+                 num_trades   = num_trades + 1,
+                 num_wins     = num_wins + excluded.num_wins""",
+            (today, realized_pnl, 1 if realized_pnl > 0 else 0),
+        )
+        self.conn.commit()
+
+        _log(
+            f"[brain] EXIT {action.position_id} → {action.next_status.value} "
+            f"({action.reason}) pnl=${realized_pnl:.2f}"
+        )
+
     def _execute_order(self, order: dict[str, Any]) -> None:
         """
         Paper execution: log trade to predictions + positions tables and
@@ -223,14 +332,16 @@ class Brain:
             "fair_value": sig.fair_value,
         })
 
-        # Open position
+        # Open position with full snapshot columns for lifecycle engine
         self.conn.execute(
             """INSERT INTO positions
                (strategy_name, market_id, ticker, city, target_date,
+                high_f, low_f, market_type, exchange,
                 side, entry_price, size_usd, status, entry_reason, opened_at)
-               VALUES (?,?,?,?,?,?,?,?,'OPENED',?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'OPENED',?,?)""",
             (
                 sig.strategy_name, sig.market_id, sig.ticker, sig.city, sig.target_date,
+                sig.high_f, sig.low_f, sig.market_type, sig.source,
                 sig.side, sig.executable_price, size_usd, entry_reason, now,
             ),
         )
