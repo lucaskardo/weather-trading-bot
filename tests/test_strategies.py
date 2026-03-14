@@ -253,9 +253,10 @@ class TestValueEntryExits:
 
     def test_exit_on_convergence(self):
         strategy = ValueEntryStrategy()
-        # Consensus exactly AT threshold → fair_value ≈ 0.50; current_price ≈ 0.50
-        forecasts = [_fresh_forecast(high_f=80.0)]  # consensus = threshold
-        pos = _position(side="YES", current_price=0.50, high_f=80.0)
+        # Consensus well above threshold → high fair_value; current_price near fair_value
+        # With half-degree rounding: fair_value for above@75 when consensus=85, std=5 ≈ 0.98
+        forecasts = [_fresh_forecast(high_f=85.0)]  # consensus = 85
+        pos = _position(side="YES", current_price=0.97, high_f=75.0)  # near fair_value
         p = _params()
 
         actions = strategy.manage_positions([pos], forecasts, p)

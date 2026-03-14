@@ -304,23 +304,30 @@ class ValueEntryStrategy(BaseStrategy):
         current_price = pos.get("current_price", entry_price)
         side = pos.get("side", "YES")
         high_f = pos.get("high_f")
+        low_f = pos.get("low_f")
+        market_type = pos.get("market_type", "above")
         opened_at_str = pos.get("opened_at", "")
 
         # --- Rule 1: Forecast reversal ---
         consensus_f, _, _, n_models = _build_consensus(forecasts, city, target_date)
         if consensus_f is not None and n_models > 0 and high_f is not None:
-            fair_value = _prob_above_threshold(consensus_f, high_f, params.base_std_f)
-            if side == "YES":
-                updated_edge = fair_value - current_price
-            else:
-                updated_edge = (1 - fair_value) - (1 - current_price)
-            if updated_edge < -0.05:
-                return {"position_id": position_id, "action": "exit", "reason": "forecast_reversal"}
+            fair_value = _compute_fair_value_for_market(
+                consensus_f, market_type, high_f, low_f, params.base_std_f
+            )
+            if fair_value is not None:
+                if side == "YES":
+                    updated_edge = fair_value - current_price
+                else:
+                    updated_edge = (1 - fair_value) - (1 - current_price)
+                if updated_edge < -0.05:
+                    return {"position_id": position_id, "action": "exit", "reason": "forecast_reversal"}
 
         # --- Rule 2: Convergence ---
         if high_f is not None and consensus_f is not None:
-            fair_value = _prob_above_threshold(consensus_f, high_f, params.base_std_f)
-            if abs(current_price - fair_value) < 0.03:
+            fair_value = _compute_fair_value_for_market(
+                consensus_f, market_type, high_f, low_f, params.base_std_f
+            )
+            if fair_value is not None and abs(current_price - fair_value) < 0.03:
                 return {"position_id": position_id, "action": "exit", "reason": "convergence"}
 
         # --- Rule 3: Stale forecast ---

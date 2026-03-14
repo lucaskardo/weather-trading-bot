@@ -120,6 +120,15 @@ class Brain:
                 _log(f"[brain] {strategy.name}.generate_signals failed: {exc}")
 
         # ------------------------------------------------------------------ #
+        # Step 1b: Inject live market prices into open positions
+        # ------------------------------------------------------------------ #
+        live_prices = {m["ticker"]: m.get("market_price") for m in markets if m.get("ticker")}
+        for pos in positions:
+            ticker = pos.get("ticker", "")
+            if ticker in live_prices and live_prices[ticker] is not None:
+                pos["current_price"] = live_prices[ticker]
+
+        # ------------------------------------------------------------------ #
         # Step 2: Manage existing positions
         # ------------------------------------------------------------------ #
         lifecycle_actions = run_lifecycle_cycle(
@@ -226,10 +235,17 @@ class Brain:
                 realized_pnl = -size_usd
         else:
             # Mid-trade exit: PnL based on price move
+            # YES: bought at entry_price, now worth exit_price
+            #   contracts = size_usd / entry_price
+            #   PnL = contracts * (exit_price - entry_price)
+            # NO: bought NO at entry_price (YES cost), worth (1 - exit_price) per contract
+            #   contracts = size_usd / entry_price  (same cost basis)
+            #   PnL = contracts * ((1 - exit_price) - entry_price)
+            contracts = size_usd / max(entry_price, 0.01)
             if side == "YES":
-                realized_pnl = (exit_price - entry_price) * size_usd / max(entry_price, 0.01)
+                realized_pnl = contracts * (exit_price - entry_price)
             else:
-                realized_pnl = (entry_price - exit_price) * size_usd / max(1.0 - entry_price, 0.01)
+                realized_pnl = size_usd * ((1.0 - exit_price) / max(entry_price, 0.01) - 1.0)
 
         opened_at = pos.get("opened_at", now)
         try:
@@ -299,17 +315,20 @@ class Brain:
             f"edge={sig.executable_edge:.3f}"
         )
 
-        # Record prediction
+        import json as _json
+        import uuid as _uuid
+
+        # Record prediction (Bug 6 fix: include market_id)
         self.conn.execute(
             """INSERT OR IGNORE INTO predictions
-               (strategy_name, ticker, city, target_date,
+               (strategy_name, market_id, ticker, city, target_date,
                 fair_value, market_price, executable_price,
                 edge, executable_edge, confidence,
                 consensus_f, agreement, n_models,
                 is_shadow, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)""",
             (
-                sig.strategy_name, sig.ticker, sig.city, sig.target_date,
+                sig.strategy_name, sig.market_id, sig.ticker, sig.city, sig.target_date,
                 sig.fair_value, sig.market_price, sig.executable_price,
                 sig.edge, sig.executable_edge, sig.confidence,
                 sig.consensus_f, sig.agreement, sig.n_models,
@@ -318,7 +337,6 @@ class Brain:
         )
 
         # Build full entry snapshot for post-trade analysis
-        import json as _json
         entry_reason = _json.dumps({
             "high_f": sig.high_f,
             "low_f": sig.low_f,
@@ -333,7 +351,7 @@ class Brain:
         })
 
         # Open position with full snapshot columns for lifecycle engine
-        self.conn.execute(
+        cursor = self.conn.execute(
             """INSERT INTO positions
                (strategy_name, market_id, ticker, city, target_date,
                 high_f, low_f, market_type, exchange,
@@ -344,6 +362,33 @@ class Brain:
                 sig.high_f, sig.low_f, sig.market_type, sig.source,
                 sig.side, sig.executable_price, size_usd, entry_reason, now,
             ),
+        )
+        position_id = cursor.lastrowid
+
+        # Record order (Bug 5 fix)
+        order_id = fill.get("order_id") or str(_uuid.uuid4())[:12]
+        from execution.orderbook import kalshi_taker_fee
+        fill_price = fill.get("fill_price", sig.executable_price)
+        requested_count = max(1, int(size_usd / max(sig.executable_price, 0.01)))
+        self.conn.execute(
+            """INSERT INTO orders
+               (id, position_id, ticker, side, order_type,
+                requested_price, requested_count, status, created_at)
+               VALUES (?,?,?,?,'limit',?,?,?,?)""",
+            (order_id, position_id, sig.ticker, sig.side,
+             sig.executable_price, requested_count, fill.get("status", "filled"), now),
+        )
+
+        # Record fill (Bug 5 fix)
+        fill_count = max(1, int(size_usd / max(fill_price, 0.01)))
+        fees_paid = kalshi_taker_fee(fill_price) * fill_count
+        self.conn.execute(
+            """INSERT INTO fills
+               (order_id, position_id, fill_price, fill_count,
+                fees_paid, execution_type, filled_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (order_id, position_id, fill_price, fill_count,
+             fees_paid, fill.get("execution_type", "taker"), now),
         )
 
         # Deduct from bankroll

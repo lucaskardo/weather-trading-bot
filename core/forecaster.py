@@ -158,14 +158,17 @@ def monte_carlo_prob(
             x = rng.gauss(mu, sigma)
             total += 1
             if mtype == "band":
+                # Match analytic: P(low_f - 0.5 <= X <= high_f + 0.5)
                 if low_f is not None and high_f is not None:
-                    if low_f <= x <= high_f:
+                    if (low_f - 0.5) <= x <= (high_f + 0.5):
                         hits += 1
             elif mtype == "below":
-                if high_f is not None and x <= high_f:
+                # Match analytic: P(X <= high_f + 0.5)
+                if high_f is not None and x <= (high_f + 0.5):
                     hits += 1
             else:  # above
-                if high_f is not None and x >= high_f:
+                # Match analytic: P(X >= high_f - 0.5)
+                if high_f is not None and x >= (high_f - 0.5):
                     hits += 1
 
     if total == 0:
