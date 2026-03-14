@@ -12,7 +12,7 @@ The optimal T is found by the calibrator's walk-forward optimizer.
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Any, Optional
 
 
 def temperature_scale(prob_raw: float, T: float) -> float:
@@ -175,6 +175,139 @@ def monte_carlo_prob(
         return 0.5
     prob = hits / total
     return max(0.01, min(0.99, prob))
+
+
+def _compute_fair_value_for_market(
+    consensus_f: float,
+    market_type: str,
+    high_f: "float | None",
+    low_f: "float | None",
+    std_f: float,
+) -> "float | None":
+    """
+    Compute P(YES) for any market type using Gaussian CDF with ±0.5 rounding.
+
+    above: P(X >= high_f - 0.5)
+    below: P(X <= high_f + 0.5)
+    band:  P(low_f - 0.5 <= X <= high_f + 0.5)
+    """
+    if std_f <= 0:
+        return None
+
+    def cdf(x: float) -> float:
+        z = (x - consensus_f) / (std_f * math.sqrt(2))
+        return 0.5 * (1.0 + math.erf(z))
+
+    mtype = (market_type or "above").lower()
+
+    if mtype == "band":
+        if low_f is None or high_f is None:
+            return None
+        prob = cdf(high_f + 0.5) - cdf(low_f - 0.5)
+    elif mtype == "below":
+        if high_f is None:
+            return None
+        prob = cdf(high_f + 0.5)
+    else:  # "above"
+        if high_f is None:
+            return None
+        prob = 1.0 - cdf(high_f - 0.5)
+
+    return max(0.01, min(0.99, prob))
+
+
+def compute_fair_value(
+    forecasts: list,
+    city: str,
+    target_date: str,
+    market_type: str,
+    high_f: "float | None",
+    low_f: "float | None",
+    params: Any,
+    conn=None,
+    use_mc: bool = True,
+) -> "tuple[float | None, float, float, int]":
+    """
+    Single canonical fair value — used by entry, exit, lifecycle, calibration.
+
+    Applies the full pipeline: bias correction, dynamic std, MC/analytic,
+    temperature scaling.
+
+    Returns:
+        (fair_value, consensus_f, std_f, n_models)
+        fair_value is None if no forecasts are available for city/date.
+    """
+    import statistics as _st
+    from datetime import datetime, timezone as _tz
+
+    relevant = [f for f in forecasts if f.city == city and f.target_date == target_date]
+    if not relevant:
+        return None, 0.0, getattr(params, "base_std_f", 5.0), 0
+
+    # Lead hours (for dynamic std)
+    try:
+        eod = datetime.fromisoformat(f"{target_date}T23:59:59+00:00")
+        lead_hours = max(0.0, (eod - datetime.now(_tz.utc)).total_seconds() / 3600)
+    except Exception:
+        lead_hours = 48.0
+
+    # Bias correction (requires DB connection)
+    bias_table = None
+    fine_bias_table = None
+    if conn is not None:
+        try:
+            from research.bias_correction import learn_biases, learn_fine_biases
+            bias_table = learn_biases(conn)
+            fine_bias_table = learn_fine_biases(conn)
+        except Exception:
+            pass
+
+    if bias_table:
+        from research.bias_correction import apply_bias
+        highs = [
+            apply_bias(
+                f.predicted_high_f, city, f.model_name, bias_table,
+                fine_bias_table=fine_bias_table,
+                target_date=target_date,
+                lead_hours=lead_hours,
+            )
+            for f in relevant
+        ]
+    else:
+        highs = [f.predicted_high_f for f in relevant]
+
+    consensus_f = _st.mean(highs)
+    agreement = _st.stdev(highs) if len(highs) > 1 else 0.0
+
+    std_f = dynamic_std_f(
+        city=city,
+        target_date=target_date,
+        model_spread=agreement,
+        lead_hours=lead_hours,
+        base_std_f=getattr(params, "base_std_f", 5.0),
+    )
+
+    if use_mc and highs:
+        fair_value = monte_carlo_prob(
+            model_forecasts=highs,
+            market_type=market_type,
+            high_f=high_f,
+            low_f=low_f,
+            sigma=std_f,
+            n_samples=getattr(params, "monte_carlo_samples", 2000),
+        )
+    else:
+        fair_value = _compute_fair_value_for_market(consensus_f, market_type, high_f, low_f, std_f)
+        if fair_value is None:
+            return None, consensus_f, std_f, len(highs)
+
+    # Temperature scaling
+    T = getattr(params, "temp_scaling_T", 1.0)
+    if T != 1.0 and 0 < fair_value < 1:
+        logit = math.log(fair_value / (1.0 - fair_value))
+        fair_value = 1.0 / (1.0 + math.exp(-logit / T))
+
+    return max(0.01, min(0.99, fair_value)), consensus_f, std_f, len(highs)
 
 
 def brier_score(predicted: float, outcome: float) -> float:

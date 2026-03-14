@@ -15,7 +15,10 @@ from __future__ import annotations
 import math
 from typing import Any, Callable
 
-from core.forecaster import brier_score, prob_above_threshold
+from core.forecaster import (
+    brier_score, prob_above_threshold,
+    _compute_fair_value_for_market, temperature_scale,
+)
 
 
 def walk_forward_brier(
@@ -61,18 +64,23 @@ def walk_forward_brier(
         fold_briers: list[float] = []
         for trade in test_trades:
             consensus_f = trade.get("consensus_f")
-            threshold_f = trade.get("threshold_f") or trade.get("high_f")
+            high_f = trade.get("high_f") or trade.get("threshold_f")
+            low_f = trade.get("low_f")
+            market_type = trade.get("market_type") or "above"
             outcome = trade.get("outcome")
 
-            if consensus_f is None or threshold_f is None or outcome is None:
+            if consensus_f is None or high_f is None or outcome is None:
                 continue
 
-            pred = prob_above_threshold(
-                float(consensus_f),
-                float(threshold_f),
+            raw_pred = _compute_fair_value_for_market(
+                float(consensus_f), market_type,
+                float(high_f),
+                float(low_f) if low_f is not None else None,
                 float(base_std_f),
-                float(temp_T),
             )
+            if raw_pred is None:
+                continue
+            pred = temperature_scale(raw_pred, float(temp_T))
             fold_briers.append(brier_score(pred, float(outcome)))
 
         if fold_briers:
@@ -111,12 +119,21 @@ def walk_forward_variance(
         fold_briers = []
         for trade in test_trades:
             consensus_f = trade.get("consensus_f")
-            threshold_f = trade.get("threshold_f") or trade.get("high_f")
+            high_f = trade.get("high_f") or trade.get("threshold_f")
+            low_f = trade.get("low_f")
+            market_type = trade.get("market_type") or "above"
             outcome = trade.get("outcome")
-            if None in (consensus_f, threshold_f, outcome):
+            if None in (consensus_f, high_f, outcome):
                 continue
-            pred = prob_above_threshold(float(consensus_f), float(threshold_f),
-                                        float(base_std_f), float(temp_T))
+            raw_pred = _compute_fair_value_for_market(
+                float(consensus_f), market_type,
+                float(high_f),
+                float(low_f) if low_f is not None else None,
+                float(base_std_f),
+            )
+            if raw_pred is None:
+                continue
+            pred = temperature_scale(raw_pred, float(temp_T))
             fold_briers.append(brier_score(pred, float(outcome)))
 
         if fold_briers:

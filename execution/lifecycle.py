@@ -279,21 +279,12 @@ def _compute_fair_value(
     market_type: str = "above",
     low_f: Optional[float] = None,
 ) -> Optional[float]:
-    import statistics as st
-    from strategies.value_entry import _compute_fair_value_for_market
-
-    relevant = [
-        f for f in forecasts
-        if f.city == city and f.target_date == target_date
-    ]
-    if not relevant:
-        return None
-
-    highs = [f.predicted_high_f for f in relevant]
-    consensus = st.mean(highs)
-    std = params.base_std_f
-
-    return _compute_fair_value_for_market(consensus, market_type, high_f, low_f, std)
+    from core.forecaster import compute_fair_value
+    fair_value, _, _, _ = compute_fair_value(
+        forecasts, city, target_date, market_type, high_f, low_f, params,
+        use_mc=False,
+    )
+    return fair_value
 
 
 def _is_forecast_stale(

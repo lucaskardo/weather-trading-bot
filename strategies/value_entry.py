@@ -18,7 +18,11 @@ import statistics
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from core.forecaster import dynamic_std_f
+from core.forecaster import (
+    dynamic_std_f,
+    compute_fair_value,
+    _compute_fair_value_for_market,  # re-exported for backward compatibility
+)
 from execution.orderbook import OrderbookLevel, get_executable_price
 from shared.params import Params, PARAMS
 from shared.types import ModelForecast
@@ -78,45 +82,6 @@ def _prob_above_threshold(consensus_f: float, threshold_f: float, std_f: float) 
     z = (threshold_f - consensus_f) / (std_f * math.sqrt(2))
     return 0.5 * math.erfc(z)
 
-
-def _compute_fair_value_for_market(
-    consensus_f: float,
-    market_type: str,
-    high_f: float | None,
-    low_f: float | None,
-    std_f: float,
-) -> float | None:
-    """
-    Compute P(YES) for any market type using Gaussian CDF.
-
-    above: P(actual >= high_f)  — uses half-degree rounding for integer settlement
-    below: P(actual <= high_f)  — uses half-degree rounding
-    band:  P(low_f <= actual <= high_f) = CDF(high_f + 0.5) - CDF(low_f - 0.5)
-    """
-    if std_f <= 0:
-        return None
-
-    def cdf(x: float) -> float:
-        """P(X <= x) under N(consensus_f, std_f^2)."""
-        z = (x - consensus_f) / (std_f * math.sqrt(2))
-        return 0.5 * (1.0 + math.erf(z))
-
-    mtype = (market_type or "above").lower()
-
-    if mtype == "band":
-        if low_f is None or high_f is None:
-            return None
-        prob = cdf(high_f + 0.5) - cdf(low_f - 0.5)
-    elif mtype == "below":
-        if high_f is None:
-            return None
-        prob = cdf(high_f + 0.5)
-    else:  # "above" (default)
-        if high_f is None:
-            return None
-        prob = 1.0 - cdf(high_f - 0.5)
-
-    return max(0.01, min(0.99, prob))
 
 
 class ValueEntryStrategy(BaseStrategy):
@@ -308,27 +273,24 @@ class ValueEntryStrategy(BaseStrategy):
         market_type = pos.get("market_type", "above")
         opened_at_str = pos.get("opened_at", "")
 
+        # Compute fair value using the canonical pipeline (analytic, no MC noise)
+        fair_value, consensus_f, _, n_models = compute_fair_value(
+            forecasts, city, target_date, market_type, high_f, low_f, params,
+            use_mc=False,
+        )
+
         # --- Rule 1: Forecast reversal ---
-        consensus_f, _, _, n_models = _build_consensus(forecasts, city, target_date)
-        if consensus_f is not None and n_models > 0 and high_f is not None:
-            fair_value = _compute_fair_value_for_market(
-                consensus_f, market_type, high_f, low_f, params.base_std_f
-            )
-            if fair_value is not None:
-                if side == "YES":
-                    updated_edge = fair_value - current_price
-                else:
-                    updated_edge = (1 - fair_value) - (1 - current_price)
-                if updated_edge < -0.05:
-                    return {"position_id": position_id, "action": "exit", "reason": "forecast_reversal"}
+        if fair_value is not None and n_models > 0:
+            if side == "YES":
+                updated_edge = fair_value - current_price
+            else:
+                updated_edge = (1 - fair_value) - (1 - current_price)
+            if updated_edge < -0.05:
+                return {"position_id": position_id, "action": "exit", "reason": "forecast_reversal"}
 
         # --- Rule 2: Convergence ---
-        if high_f is not None and consensus_f is not None:
-            fair_value = _compute_fair_value_for_market(
-                consensus_f, market_type, high_f, low_f, params.base_std_f
-            )
-            if fair_value is not None and abs(current_price - fair_value) < 0.03:
-                return {"position_id": position_id, "action": "exit", "reason": "convergence"}
+        if fair_value is not None and abs(current_price - fair_value) < 0.03:
+            return {"position_id": position_id, "action": "exit", "reason": "convergence"}
 
         # --- Rule 3: Stale forecast ---
         stale = _is_forecast_stale(forecasts, city, target_date, params.stale_forecast_hours)

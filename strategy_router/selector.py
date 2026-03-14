@@ -47,6 +47,8 @@ def select_signals(
     orders: list[dict[str, Any]] = []
     # Track cluster exposure added this cycle (to prevent intra-cycle breaches)
     cycle_cluster_add: dict[str, float] = {}
+    # Track remaining per-strategy budget so we don't overspend in one cycle
+    remaining_budget = dict(allocations)
 
     for sig in ranked:
         order: dict[str, Any] = {"signal": sig}
@@ -75,16 +77,17 @@ def select_signals(
             orders.append(order)
             continue
 
-        # --- Gate 4: Allocated capital available ---
-        strategy_budget = allocations.get(sig.strategy_name, 0.0)
+        # --- Gate 4: Remaining allocated capital ---
+        strategy_budget = remaining_budget.get(sig.strategy_name, 0.0)
         if strategy_budget <= 0:
             order["size_usd"] = 0.0
             order["reason_skipped"] = "no_budget"
             orders.append(order)
             continue
 
-        # --- Size: Kelly within budget ---
+        # --- Size: Kelly within remaining budget ---
         size_usd = _kelly_size(sig, strategy_budget, params)
+        size_usd = min(size_usd, strategy_budget)  # never exceed remaining budget
         if size_usd <= 0:
             order["size_usd"] = 0.0
             order["reason_skipped"] = "kelly_too_small"
@@ -95,6 +98,7 @@ def select_signals(
         order["reason_skipped"] = None
 
         # Update tracking
+        remaining_budget[sig.strategy_name] -= size_usd
         city_counts[sig.city] = city_counts.get(sig.city, 0) + 1
         if cluster:
             cycle_cluster_add[cluster] = cycle_cluster_add.get(cluster, 0.0) + size_usd

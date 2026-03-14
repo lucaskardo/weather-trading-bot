@@ -159,6 +159,27 @@ def _compute_vwap(
     return vwap, total_depth
 
 
+def get_exit_price(current_price: float, side: str, params: Optional[Params] = None) -> float:
+    """
+    Net proceeds per dollar invested when exiting a position at current_price.
+
+    Deducts slippage and taker fee from the gross exit value so that
+    _process_exit PnL reflects real round-trip costs.
+
+    For YES: we sell at (current_price - slippage - fee).
+    For NO:  our contract is worth (1 - current_price); we deduct costs from that.
+
+    Returns a value in (0, 1).
+    """
+    p = params or PARAMS
+    slippage = p.slippage_buffer_cents / 100.0
+    fee = kalshi_taker_fee(current_price)
+    if side == "YES":
+        return max(0.01, current_price - slippage - fee)
+    else:
+        return max(0.01, (1.0 - current_price) - slippage - fee)
+
+
 def _estimate_depth(mid_price: float, target_size_usd: float) -> float:
     """
     When no real orderbook is available, estimate depth heuristically.

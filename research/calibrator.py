@@ -22,7 +22,10 @@ from pathlib import Path
 from typing import Any
 
 from clients.nws_settlement import fetch_settlement, SettlementError
-from core.forecaster import brier_decomposition, prob_above_threshold
+from core.forecaster import (
+    brier_decomposition, prob_above_threshold,
+    _compute_fair_value_for_market, temperature_scale,
+)
 from research.walk_forward import walk_forward_brier
 from research.optimizer import optimize_params, save_params, OptimizerResult
 from shared.params import Params, PARAMS
@@ -117,11 +120,20 @@ def run_calibration(
     for t in trade_log:
         if t.get("outcome") is None:
             continue
-        if t.get("consensus_f") is not None and t.get("threshold_f") is not None:
-            pred = prob_above_threshold(
-                t["consensus_f"], t["threshold_f"],
-                params.base_std_f, params.temp_scaling_T,
+        if t.get("consensus_f") is not None:
+            market_type = t.get("market_type") or "above"
+            high_f = t.get("high_f") or t.get("threshold_f")
+            low_f = t.get("low_f")
+            raw_pred = _compute_fair_value_for_market(
+                t["consensus_f"], market_type,
+                float(high_f) if high_f is not None else None,
+                float(low_f) if low_f is not None else None,
+                params.base_std_f,
             )
+            if raw_pred is not None:
+                pred = temperature_scale(raw_pred, params.temp_scaling_T)
+            else:
+                pred = t.get("fair_value", 0.5) or 0.5
         else:
             # Fallback: use stored fair_value (the prediction made at entry time)
             pred = t.get("fair_value", 0.5) or 0.5
@@ -175,13 +187,15 @@ def run_calibration(
 
 def _load_resolved_predictions(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
-        """SELECT id, strategy_name, city, target_date, fair_value,
-                  consensus_f, market_price, outcome, brier_score,
-                  actual_high_f, created_at
-           FROM predictions
-           WHERE outcome IS NOT NULL
-             AND is_shadow = 0
-           ORDER BY created_at"""
+        """SELECT p.id, p.strategy_name, p.city, p.target_date, p.fair_value,
+                  p.consensus_f, p.market_price, p.outcome, p.brier_score,
+                  p.actual_high_f, p.created_at,
+                  m.market_type, m.high_f, m.low_f
+           FROM predictions p
+           LEFT JOIN markets m ON p.market_id = m.id
+           WHERE p.outcome IS NOT NULL
+             AND p.is_shadow = 0
+           ORDER BY p.created_at"""
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -252,7 +266,10 @@ def _build_trade_log(rows: list[dict]) -> list[dict[str, Any]]:
             continue
         result.append({
             "consensus_f": r.get("consensus_f"),
-            "threshold_f": r.get("threshold_f"),   # may be None
+            "threshold_f": r.get("threshold_f"),   # may be None (legacy)
+            "market_type": r.get("market_type") or "above",
+            "high_f": r.get("high_f"),
+            "low_f": r.get("low_f"),
             "fair_value": r.get("fair_value", 0.5) or 0.5,
             "outcome": float(r["outcome"]),
             "city": r.get("city"),

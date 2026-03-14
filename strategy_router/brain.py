@@ -234,18 +234,15 @@ class Brain:
             else:
                 realized_pnl = -size_usd
         else:
-            # Mid-trade exit: PnL based on price move
-            # YES: bought at entry_price, now worth exit_price
-            #   contracts = size_usd / entry_price
-            #   PnL = contracts * (exit_price - entry_price)
-            # NO: bought NO at entry_price (YES cost), worth (1 - exit_price) per contract
-            #   contracts = size_usd / entry_price  (same cost basis)
-            #   PnL = contracts * ((1 - exit_price) - entry_price)
+            # Mid-trade exit: net proceeds after slippage + fee
+            from execution.orderbook import get_exit_price
+            net_exit = get_exit_price(exit_price, side, self.params)
             contracts = size_usd / max(entry_price, 0.01)
             if side == "YES":
-                realized_pnl = contracts * (exit_price - entry_price)
+                realized_pnl = contracts * (net_exit - entry_price)
             else:
-                realized_pnl = size_usd * ((1.0 - exit_price) / max(entry_price, 0.01) - 1.0)
+                # net_exit = (1 - exit_price) - costs; entry_price = YES price paid
+                realized_pnl = size_usd * (net_exit / max(entry_price, 0.01) - 1.0)
 
         opened_at = pos.get("opened_at", now)
         try:
