@@ -20,7 +20,7 @@ from typing import Any, Optional
 
 import requests
 
-KALSHI_BASE = "https://trading-api.kalshi.com/trade-api/v2"
+KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
 WEATHER_SERIES = [
     "KXHIGHNY", "KXHIGHCHI", "KXHIGHLA", "KXHIGHDC",
@@ -98,16 +98,25 @@ def fetch_orderbook(
     try:
         resp = s.get(url, timeout=timeout)
         resp.raise_for_status()
-        data = resp.json().get("orderbook", {})
+        raw = resp.json()
+        data = raw.get("orderbook", {})
+        data_fp = raw.get("orderbook_fp", {})
     except Exception as exc:
         print(f"[kalshi] orderbook error for {ticker}: {exc}", file=sys.stderr)
         return []
 
     levels = []
-    for price_cents, size in (data.get("yes", []) or []):
-        price = price_cents / 100.0
-        size_usd = price * size  # contracts × price = notional USD
-        levels.append({"price": price, "size_usd": size_usd})
+    # Prefer new fixed-point format (orderbook_fp.yes_dollars) over legacy cents
+    if data_fp and data_fp.get("yes_dollars"):
+        for price_dollars, count_fp in (data_fp.get("yes_dollars", []) or []):
+            price = float(price_dollars)
+            size_usd = price * float(count_fp)
+            levels.append({"price": price, "size_usd": size_usd})
+    else:
+        for price_cents, size in (data.get("yes", []) or []):
+            price = price_cents / 100.0
+            size_usd = price * size
+            levels.append({"price": price, "size_usd": size_usd})
 
     return sorted(levels, key=lambda x: x["price"])
 
@@ -121,8 +130,10 @@ def _fetch_events(
     series_ticker: str,
     timeout: int,
 ) -> list[dict]:
-    url = f"{KALSHI_BASE}/series/{series_ticker}/events"
-    params = {"status": "open", "limit": 100}
+    """Fetch open events for a series using the Kalshi v2 events endpoint."""
+    url = f"{KALSHI_BASE}/events"
+    params = {"series_ticker": series_ticker, "status": "open", "limit": 100,
+              "with_nested_markets": "true"}
     resp = session.get(url, params=params, timeout=timeout)
     resp.raise_for_status()
     return resp.json().get("events", [])
@@ -135,14 +146,21 @@ def _fetch_markets_for_event(
     timeout: int,
 ) -> list[dict[str, Any]]:
     event_ticker = event.get("event_ticker", "")
-    url = f"{KALSHI_BASE}/events/{event_ticker}/markets"
-    try:
-        resp = session.get(url, timeout=timeout)
-        resp.raise_for_status()
-        raw_markets = resp.json().get("markets", [])
-    except Exception as exc:
-        print(f"[kalshi] markets error for {event_ticker}: {exc}", file=sys.stderr)
-        return []
+
+    # If markets were nested in the event response (with_nested_markets=true), use them
+    raw_markets = event.get("markets") or []
+
+    if not raw_markets:
+        # Fallback: fetch markets separately using query params (correct v2 API)
+        url = f"{KALSHI_BASE}/markets"
+        try:
+            resp = session.get(url, params={"event_ticker": event_ticker, "limit": 100},
+                               timeout=timeout)
+            resp.raise_for_status()
+            raw_markets = resp.json().get("markets", [])
+        except Exception as exc:
+            print(f"[kalshi] markets error for {event_ticker}: {exc}", file=sys.stderr)
+            return []
 
     results = []
     for m in raw_markets:
@@ -164,9 +182,27 @@ def _parse_market(m: dict, city: str) -> Optional[dict[str, Any]]:
     if not target_date:
         return None
 
-    # Market price: use yes_ask (best ask for YES contracts), fallback to midpoint
-    yes_bid = (m.get("yes_bid") or 0) / 100.0
-    yes_ask = (m.get("yes_ask") or 0) / 100.0
+    # Market price: support both legacy cents (yes_bid/yes_ask) and
+    # new fixed-point dollar strings (yes_bid_dollars/yes_ask_dollars).
+    # Kalshi deprecated integer cents fields as of March 2026.
+    def _read_price(m: dict, field_cents: str, field_dollars: str) -> float:
+        """Read price as 0-1 probability, preferring _dollars fields."""
+        dollars_val = m.get(field_dollars)
+        if dollars_val is not None:
+            try:
+                return float(dollars_val)
+            except (ValueError, TypeError):
+                pass
+        cents_val = m.get(field_cents)
+        if cents_val is not None and cents_val != 0:
+            try:
+                return int(cents_val) / 100.0
+            except (ValueError, TypeError):
+                pass
+        return 0.0
+
+    yes_bid = _read_price(m, "yes_bid", "yes_bid_dollars")
+    yes_ask = _read_price(m, "yes_ask", "yes_ask_dollars")
     if yes_ask > 0:
         market_price = yes_ask
     elif yes_bid > 0:

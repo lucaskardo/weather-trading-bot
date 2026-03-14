@@ -88,8 +88,11 @@ class TestParseTicker:
 # fetch_all_weather_markets
 # ---------------------------------------------------------------------------
 
-def _make_event_response(event_ticker="KXHIGHNY-26MAR13"):
-    return {"events": [{"event_ticker": event_ticker}]}
+def _make_event_response(event_ticker="KXHIGHNY-26MAR13", include_markets=False):
+    event = {"event_ticker": event_ticker}
+    if include_markets:
+        event["markets"] = [_make_markets_response(f"{event_ticker}-T68")["markets"][0]]
+    return {"events": [event]}
 
 
 def _make_markets_response(ticker="KXHIGHNY-26MAR13-T68", status="open"):
@@ -98,8 +101,12 @@ def _make_markets_response(ticker="KXHIGHNY-26MAR13-T68", status="open"):
             "ticker": ticker,
             "status": status,
             "subtitle": "above 68 degrees",
+            # Legacy integer-cent fields (still supported)
             "yes_bid": 55,
             "yes_ask": 57,
+            # New fixed-point dollar fields (preferred as of March 2026)
+            "yes_bid_dollars": "0.55",
+            "yes_ask_dollars": "0.57",
             "volume": 1000,
             "open_interest": 500,
         }]
@@ -108,6 +115,13 @@ def _make_markets_response(ticker="KXHIGHNY-26MAR13-T68", status="open"):
 
 class TestFetchAllWeatherMarkets:
     def _mock_session(self, event_resp, markets_resp):
+        """
+        Route by URL/params:
+          /events (GET /events?series_ticker=...) → events_r
+          /markets (GET /markets?event_ticker=...)  → markets_r
+        The URL heuristic still works: events URL contains '/events',
+        markets fallback URL contains '/markets' (not '/events').
+        """
         session = MagicMock()
         events_r = MagicMock()
         events_r.json.return_value = event_resp
@@ -193,6 +207,52 @@ class TestFetchAllWeatherMarkets:
                     "high_f", "market_price", "exchange", "volume", "open_interest"}
         assert required.issubset(result[0].keys())
 
+    def test_dollars_fields_take_precedence_over_cents(self):
+        """_dollars fields are preferred; cents fields ignored when both present."""
+        session = self._mock_session(
+            _make_event_response("KXHIGHNY-26MAR13"),
+            {"markets": [{
+                "ticker": "KXHIGHNY-26MAR13-T68",
+                "status": "open",
+                "subtitle": "above 68 degrees",
+                "yes_bid": 40,           # legacy cents (0.40) — should be ignored
+                "yes_ask": 42,           # legacy cents (0.42) — should be ignored
+                "yes_bid_dollars": "0.62",   # new dollars — should win
+                "yes_ask_dollars": "0.64",   # new dollars — should win
+                "volume": 100,
+                "open_interest": 50,
+            }]},
+        )
+        with patch("clients.kalshi_client.WEATHER_SERIES", ["KXHIGHNY"]):
+            result = fetch_all_weather_markets(session=session)
+        # ask_dollars=0.64 should be used as market_price
+        assert abs(result[0]["market_price"] - 0.64) < 1e-9
+
+    def test_nested_markets_used_when_present(self):
+        """When event has nested markets, no separate /markets call is made."""
+        session = MagicMock()
+        events_r = MagicMock()
+        events_r.json.return_value = _make_event_response(
+            "KXHIGHNY-26MAR13", include_markets=True
+        )
+
+        call_log = []
+        def get_side_effect(url, **kwargs):
+            call_log.append(url)
+            if "/events" in url and "/markets" not in url:
+                return events_r
+            raise AssertionError(f"Should not call fallback: {url}")
+
+        session.get.side_effect = get_side_effect
+
+        with patch("clients.kalshi_client.WEATHER_SERIES", ["KXHIGHNY"]):
+            result = fetch_all_weather_markets(session=session)
+
+        assert len(result) == 1
+        assert result[0]["city"] == "NYC"
+        # Only one HTTP call (events), no fallback markets call
+        assert all("/events" in u for u in call_log)
+
 
 # ---------------------------------------------------------------------------
 # fetch_orderbook
@@ -237,3 +297,29 @@ class TestFetchOrderbook:
         session.get.return_value = resp
         levels = fetch_orderbook("TICKER", session=session)
         assert levels == []
+
+    def test_orderbook_fp_preferred_over_legacy(self):
+        """orderbook_fp.yes_dollars takes precedence over orderbook.yes (cents)."""
+        session = MagicMock()
+        resp = MagicMock()
+        resp.json.return_value = {
+            "orderbook": {"yes": [[40, 100], [42, 200]]},   # legacy cents — ignored
+            "orderbook_fp": {"yes_dollars": [["0.62", "100"], ["0.64", "200"]]},
+        }
+        session.get.return_value = resp
+        levels = fetch_orderbook("TICKER", session=session)
+        assert len(levels) == 2
+        assert levels[0]["price"] == pytest.approx(0.62)
+        assert levels[1]["price"] == pytest.approx(0.64)
+
+    def test_orderbook_legacy_fallback_when_no_fp(self):
+        """Falls back to legacy integer-cent orderbook when orderbook_fp absent."""
+        session = MagicMock()
+        resp = MagicMock()
+        resp.json.return_value = {
+            "orderbook": {"yes": [[55, 100], [57, 200]]},
+        }
+        session.get.return_value = resp
+        levels = fetch_orderbook("TICKER", session=session)
+        assert levels[0]["price"] == pytest.approx(0.55)
+        assert levels[1]["price"] == pytest.approx(0.57)

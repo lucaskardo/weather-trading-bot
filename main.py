@@ -45,14 +45,10 @@ def startup_checks(conn) -> None:
 
 
 def _load_promoted_params(conn) -> None:
-    """Apply any previously promoted experiment params from the DB."""
-    # NOTE: intentionally mutates PARAMS at startup only — this is the single
-    # controlled point where promoted params are applied to the session singleton.
-    try:
-        from research.autoresearch import load_promoted_params
-        load_promoted_params(conn, PARAMS)
-    except Exception as exc:
-        print(f"[startup] Could not load promoted params: {exc}", file=sys.stderr)
+    """No-op: promoted params are now loaded per-cycle into _cycle_params."""
+    # Promoted params are applied in run_once() via load_promoted_params(conn, _cycle_params).
+    # The global PARAMS singleton is never mutated.
+    pass
 
 
 def _reconcile_on_startup(conn) -> None:
@@ -366,6 +362,16 @@ def run_once(paper: bool = True, live: bool = False) -> dict:
 
     startup_checks(conn)
 
+    # Build per-cycle params: copy defaults then overlay any promoted experiment values.
+    # This ensures the global PARAMS singleton is never mutated at runtime.
+    from dataclasses import replace as _replace
+    _cycle_params = _replace(PARAMS)
+    try:
+        from research.autoresearch import load_promoted_params
+        load_promoted_params(conn, _cycle_params)
+    except Exception:
+        pass  # no promoted params yet — use defaults
+
     from execution.exchange_executor import PaperExecutor, KalshiExecutor
     if live:
         try:
@@ -376,7 +382,7 @@ def run_once(paper: bool = True, live: bool = False) -> dict:
     else:
         executor = PaperExecutor()
 
-    brain = Brain(conn=conn, params=PARAMS, dry_run=dry_run, executor=executor)
+    brain = Brain(conn=conn, params=_cycle_params, dry_run=dry_run, executor=executor)
 
     if paper or live:
         markets = _fetch_markets()
