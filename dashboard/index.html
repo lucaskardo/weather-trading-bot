@@ -267,26 +267,35 @@ function Tab1() {
         )}
       </div>
 
-      {/* Recent trades */}
+      {/* Recent trades / Opportunities */}
       <div className="card">
-        <h2 style={{marginBottom: 16}}>Recent Trades</h2>
+        <h2 style={{marginBottom: 16}}>Recent Signals</h2>
         <table>
           <thead><tr>
-            <th>Strategy</th><th>Ticker</th><th>City</th>
-            <th>Fair Value</th><th>Market Price</th><th>Edge</th><th>Time</th>
+            <th>Age</th><th>Strategy</th><th>Ticker</th><th>City</th>
+            <th>Fair Value</th><th>Market Price</th><th>Edge</th>
           </tr></thead>
           <tbody>
-            {(recent || []).map(t => (
-              <tr key={t.id}>
-                <td>{t.strategy_name}</td>
-                <td style={{fontFamily: 'monospace', fontSize: 12}}>{t.ticker}</td>
-                <td>{t.city}</td>
-                <td>{fmt(t.fair_value, 3)}</td>
-                <td>{fmt(t.market_price, 3)}</td>
-                <td className={t.executable_edge > 0 ? 'pos' : 'neg'}>{fmt(t.executable_edge, 3)}</td>
-                <td style={{fontSize: 11, color: '#718096'}}>{(t.created_at || "").substring(0, 16)}</td>
-              </tr>
-            ))}
+            {(recent || []).map(t => {
+              const ageMs  = Date.now() - new Date((t.created_at || '') + 'Z').getTime();
+              const ageMin = Math.floor(ageMs / 60000);
+              const fresh  = ageMin < 10;
+              const ageStr = ageMin < 60 ? `${ageMin}m ago` : `${Math.floor(ageMin/60)}h ago`;
+              const freshBadge = fresh
+                ? <span style={{color:'#68d391',fontSize:11,fontWeight:700}}>● LIVE</span>
+                : <span style={{color:'#718096',fontSize:11}}>{ageStr}</span>;
+              return (
+                <tr key={t.id} style={{opacity: fresh ? 1 : 0.6}}>
+                  <td>{freshBadge}</td>
+                  <td>{t.strategy_name}</td>
+                  <td style={{fontFamily: 'monospace', fontSize: 12}}>{t.ticker}</td>
+                  <td>{t.city}</td>
+                  <td>{fmt(t.fair_value, 3)}</td>
+                  <td>{fmt(t.market_price, 3)}</td>
+                  <td className={t.executable_edge > 0 ? 'pos' : 'neg'}>{fmt(t.executable_edge, 3)}</td>
+                </tr>
+              );
+            })}
             {(!recent || recent.length === 0) && (
               <tr><td colSpan={7} style={{textAlign: 'center', color: '#718096', padding: 24}}>No trades yet</td></tr>
             )}
@@ -555,11 +564,83 @@ function Tab4() {
   );
 }
 
+// ─── Tab 5: History ──────────────────────────────────────────────────────────
+function Tab5() {
+  const { data: closed, loading: closedLoading } = useApi("/positions?status=closed&limit=100");
+  const { data: daily, loading: dailyLoading } = useApi("/daily_pnl");
+
+  return (
+    <div className="grid" style={{gap: 20}}>
+      {/* Daily PnL History */}
+      <div className="card">
+        <h2 style={{marginBottom: 16}}>Daily P&L History</h2>
+        {dailyLoading ? <div className="loading">Loading...</div> : (
+          <table>
+            <thead><tr>
+              <th>Date</th><th>Realized P&L</th><th>Cumulative P&L</th>
+              <th>Trades</th><th>Wins</th><th>Win Rate</th>
+            </tr></thead>
+            <tbody>
+              {(daily || []).map((d, i) => (
+                <tr key={i}>
+                  <td>{d.date}</td>
+                  <td>{fmtPnl(d.realized_pnl)}</td>
+                  <td>{fmtPnl(d.cumulative_pnl)}</td>
+                  <td>{d.num_trades}</td>
+                  <td>{d.num_wins}</td>
+                  <td>{d.win_rate != null ? fmtPct(d.win_rate) : "—"}</td>
+                </tr>
+              ))}
+              {(!daily || daily.length === 0) && (
+                <tr><td colSpan={6} style={{textAlign: 'center', color: '#718096', padding: 24}}>No daily P&L data yet</td></tr>
+              )}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* Closed Positions */}
+      <div className="card">
+        <h2 style={{marginBottom: 16}}>Closed Positions</h2>
+        {closedLoading ? <div className="loading">Loading...</div> : (
+          <table>
+            <thead><tr>
+              <th>Ticker</th><th>City</th><th>Strategy</th><th>Side</th>
+              <th>Entry</th><th>Exit</th><th>Size</th><th>P&L</th>
+              <th>Hold (h)</th><th>Status</th><th>Closed</th>
+            </tr></thead>
+            <tbody>
+              {(closed || []).map(p => (
+                <tr key={p.id}>
+                  <td style={{fontFamily: 'monospace', fontSize: 12}}>{p.ticker}</td>
+                  <td>{p.city}</td>
+                  <td>{p.strategy_name}</td>
+                  <td><span className={p.side === 'YES' ? 'pos' : 'neg'}>{p.side}</span></td>
+                  <td>{fmt(p.entry_price, 3)}</td>
+                  <td>{fmt(p.exit_price, 3)}</td>
+                  <td>${fmt(p.size_usd)}</td>
+                  <td>{fmtPnl(p.realized_pnl)}</td>
+                  <td>{fmt(p.hold_time_hours, 1)}</td>
+                  <td><StatusTag status={p.status} /></td>
+                  <td style={{fontSize: 11, color: '#718096'}}>{(p.closed_at || "").substring(0, 16)}</td>
+                </tr>
+              ))}
+              {(!closed || closed.length === 0) && (
+                <tr><td colSpan={11} style={{textAlign: 'center', color: '#718096', padding: 24}}>No closed positions yet</td></tr>
+              )}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── Root App ────────────────────────────────────────────────────────────────
 function App() {
   const [tab, setTab] = React.useState(0);
   const [lastUpdate, setLastUpdate] = React.useState(new Date().toLocaleTimeString());
-  const tabs = ["Live Trading", "Strategy Performance", "Autoresearch", "Forecast Quality"];
+  const tabs = ["Live Trading", "Strategy Performance", "Autoresearch", "Forecast Quality", "History"];
 
   function refresh() {
     setLastUpdate(new Date().toLocaleTimeString());
@@ -591,6 +672,7 @@ function App() {
         {tab === 1 && <Tab2 />}
         {tab === 2 && <Tab3 />}
         {tab === 3 && <Tab4 />}
+        {tab === 4 && <Tab5 />}
       </div>
     </div>
   );
