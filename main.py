@@ -14,10 +14,14 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+from dotenv import load_dotenv
+load_dotenv()
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -27,10 +31,26 @@ from strategy_router.brain import Brain
 from risk.reconciliation import reconcile_positions
 
 
+def _header(title: str) -> None:
+    print(f"\n{'─' * 50}")
+    print(f"  {title}")
+    print(f"{'─' * 50}")
+
+
 def startup_checks(conn) -> None:
     assert_db_integrity(conn)
     _reconcile_on_startup(conn)
+    _load_promoted_params(conn)
     _check_params_sanity(PARAMS)
+
+
+def _load_promoted_params(conn) -> None:
+    """Apply any previously promoted experiment params from the DB."""
+    try:
+        from research.autoresearch import load_promoted_params
+        load_promoted_params(conn, PARAMS)
+    except Exception as exc:
+        print(f"[startup] Could not load promoted params: {exc}", file=sys.stderr)
 
 
 def _reconcile_on_startup(conn) -> None:
@@ -121,6 +141,202 @@ def _fetch_forecasts(markets: list, conn) -> list:
     return forecasts
 
 
+def _print_config() -> None:
+    """Print active configuration at startup so user knows what's running."""
+    env_exists   = Path(".env").exists()
+    bankroll     = float(os.environ.get("BANKROLL", 1000.0))
+    loss_limit   = float(os.environ.get("DAILY_LOSS_LIMIT", 50.0))
+    interval     = int(os.environ.get("POLL_INTERVAL_S", 300))
+    noaa_token   = "set" if os.environ.get("NOAA_CDO_TOKEN") else "MISSING (settlement uses IEM fallback)"
+    kalshi_key   = "set" if os.environ.get("KALSHI_KEY_ID") else "not set (only needed for live trading)"
+
+    _header("CONFIG")
+    print(f"  .env file        {'found' if env_exists else 'NOT found — using defaults'}")
+    print(f"  Bankroll         ${bankroll:.2f}")
+    print(f"  Daily loss limit ${loss_limit:.2f}")
+    print(f"  Poll interval    {interval}s")
+    print(f"  NOAA CDO token   {noaa_token}")
+    print(f"  Kalshi API key   {kalshi_key}")
+
+
+def _settle_expired_positions(conn, open_positions: list[dict]) -> dict:
+    """
+    For each open position whose target_date has passed, fetch actual
+    settlement temperature and return settlement results for brain.run_cycle().
+
+    Returns: {position_id: {"won": bool, "actual_high_f": float}}
+    """
+    from clients.nws_settlement import fetch_settlement, SettlementError
+    from datetime import date
+
+    results = {}
+    today = date.today()
+
+    for pos in open_positions:
+        td = pos.get("target_date", "")
+        try:
+            if date.fromisoformat(td) >= today:
+                continue  # not yet settled
+        except ValueError:
+            continue
+
+        city        = pos.get("city", "")
+        pos_id      = pos.get("id")
+        high_f      = pos.get("high_f")
+        low_f       = pos.get("low_f")
+        market_type = pos.get("market_type", "above")
+        side        = pos.get("side", "YES")
+
+        # Check settlement cache first
+        cached = conn.execute(
+            "SELECT actual_high_f FROM settlement_cache WHERE city=? AND target_date=?",
+            (city, td)
+        ).fetchone()
+
+        if cached:
+            actual_high = float(cached["actual_high_f"])
+        else:
+            try:
+                result = fetch_settlement(city, td)
+                actual_high = result["actual_high_f"]
+                conn.execute(
+                    """INSERT OR REPLACE INTO settlement_cache
+                       (city, target_date, actual_high_f, station, fetched_at)
+                       VALUES (?, ?, ?, 'NWS', ?)""",
+                    (city, td, actual_high, datetime.now(timezone.utc).isoformat())
+                )
+                conn.commit()
+                print(f"[settle] {city}/{td}: actual high = {actual_high:.1f}°F")
+            except (SettlementError, KeyError, Exception) as exc:
+                print(f"[settle] {city}/{td} error: {exc}", file=sys.stderr)
+                continue
+
+        if market_type == "above":
+            outcome = 1.0 if actual_high >= high_f else 0.0
+        elif market_type == "below":
+            outcome = 1.0 if actual_high < high_f else 0.0
+        elif market_type == "band" and low_f is not None:
+            outcome = 1.0 if (low_f <= actual_high < high_f) else 0.0
+        else:
+            outcome = 0.0
+
+        won = (outcome == 1.0) if side == "YES" else (outcome == 0.0)
+        results[pos_id] = {"won": won, "actual_high_f": actual_high}
+        print(f"[settle] position {pos_id} {city}/{td} → {'WON' if won else 'LOST'} "
+              f"(actual={actual_high:.1f}°F, threshold={high_f}°F, type={market_type})")
+
+    return results
+
+
+def run_diagnose() -> None:
+    """Test all external APIs and DB connectivity."""
+    _header("DIAGNOSE")
+
+    print("\n[1] Kalshi — connectivity")
+    try:
+        import requests
+        r = requests.get("https://trading-api.kalshi.com/trade-api/v2/exchange/status", timeout=5)
+        print(f"  OK  status={r.status_code}")
+    except Exception as exc:
+        print(f"  FAIL  {exc}")
+
+    print("\n[1b] Kalshi — live weather market fetch")
+    try:
+        from clients.kalshi_client import fetch_all_weather_markets as _k
+        km = _k()
+        if km:
+            print(f"  {len(km)} future weather markets found")
+            for m in km[:5]:
+                print(f"     {m['ticker']:<38} {m['city']}  {m['target_date']}  price={m['market_price']:.2f}")
+            if len(km) > 5:
+                print(f"     ... and {len(km)-5} more")
+        else:
+            print("  0 markets — Kalshi may have no active weather series today")
+            print("  The bot will try keyword search automatically during --paper")
+    except Exception as exc:
+        print(f"  FAIL  {exc}")
+
+    print("\n[2] Open-Meteo — weather forecast")
+    try:
+        from clients.weather import fetch_and_store
+        conn = init_db()
+        from datetime import date, timedelta
+        td = (date.today() + timedelta(days=2)).isoformat()
+        fs = fetch_and_store("NYC", td, conn)
+        print(f"  OK  {len(fs)} model forecast(s) for NYC/{td}")
+    except Exception as exc:
+        print(f"  FAIL  {exc}")
+
+    print("\n[3] SQLite DB")
+    try:
+        conn = init_db()
+        assert_db_integrity(conn)
+        print(f"  OK  {Path('data/bot.db').resolve()}")
+    except Exception as exc:
+        print(f"  FAIL  {exc}")
+
+    print("\n[4] Polymarket — connectivity")
+    try:
+        import requests
+        r = requests.get("https://gamma-api.polymarket.com/markets?limit=1", timeout=5)
+        print(f"  OK  status={r.status_code}")
+    except Exception as exc:
+        print(f"  FAIL  {exc}")
+
+    print("\n[4b] Polymarket — live weather market fetch")
+    try:
+        from clients.polymarket_client import fetch_all_weather_markets as _p
+        pm = _p()
+        if pm:
+            print(f"  {len(pm)} future weather markets found")
+            for m in pm[:3]:
+                print(f"     {m['city']}  {m['target_date']}  price={m['market_price']:.2f}")
+        else:
+            print("  0 future markets on Polymarket today")
+    except Exception as exc:
+        print(f"  FAIL  {exc}")
+
+    print("\n[5] NOAA settlement (IEM fallback)")
+    try:
+        from clients.nws_settlement import fetch_settlement
+        from datetime import date, timedelta
+        td = (date.today() - timedelta(days=3)).isoformat()
+        r = fetch_settlement("NYC", td)
+        print(f"  OK  NYC/{td}: {r['actual_high_f']:.1f}°F (source={r['source']})")
+    except Exception as exc:
+        print(f"  FAIL  {exc}")
+
+    print()
+
+
+def run_status() -> None:
+    """Show current portfolio and open positions."""
+    conn = init_db()
+    _header("STATUS")
+
+    row = conn.execute("SELECT * FROM portfolio WHERE id=1").fetchone()
+    if row:
+        print(f"  Bankroll         ${row['bankroll']:.2f}")
+        print(f"  Cash available   ${row['cash_available']:.2f}")
+        print(f"  Total PnL        ${row['total_pnl'] or 0:.2f}")
+
+    positions = conn.execute(
+        """SELECT * FROM positions
+           WHERE status NOT IN ('WON','LOST','EXITED_CONVERGENCE',
+                                'EXITED_STOP','EXITED_PRE_SETTLEMENT')
+           ORDER BY opened_at DESC"""
+    ).fetchall()
+    print(f"\n  Open Positions: {len(positions)}")
+    for p in positions:
+        print(f"    {p['ticker']:<30} {p['side']:<4} ${p['size_usd']:.0f}  "
+              f"entry={p['entry_price']:.3f}  status={p['status']}")
+
+    closed = conn.execute(
+        "SELECT COUNT(*), SUM(realized_pnl) FROM positions WHERE realized_pnl IS NOT NULL"
+    ).fetchone()
+    print(f"\n  Closed Positions: {closed[0] or 0}  Total realized PnL: ${closed[1] or 0:.2f}")
+
+
 def run_once(paper: bool = True, live: bool = False) -> dict:
     """
     Run a single trading cycle.
@@ -128,10 +344,24 @@ def run_once(paper: bool = True, live: bool = False) -> dict:
     paper=True  → fetch real market data, execute paper trades (log to DB only)
     live=True   → fetch real data AND place real exchange orders
     """
-    dry_run = not live
+    _print_config()
+
+    dry_run = False  # execution is controlled by executor choice (Paper vs Kalshi), not this flag
 
     conn = init_db()
     migrate_from_json()
+
+    # Apply BANKROLL from env only if DB was just initialised with the default $1000
+    bankroll_env = float(os.environ.get("BANKROLL", 1000.0))
+    row = conn.execute("SELECT bankroll FROM portfolio WHERE id=1").fetchone()
+    if row and abs(float(row["bankroll"]) - 1000.0) < 0.01 and abs(bankroll_env - 1000.0) > 0.01:
+        conn.execute(
+            "UPDATE portfolio SET bankroll=?, cash_available=?, updated_at=? WHERE id=1",
+            (bankroll_env, bankroll_env, datetime.now(timezone.utc).isoformat())
+        )
+        conn.commit()
+        print(f"  Bankroll set from .env: ${bankroll_env:.2f}")
+
     startup_checks(conn)
 
     from execution.exchange_executor import PaperExecutor, KalshiExecutor
@@ -155,11 +385,13 @@ def run_once(paper: bool = True, live: bool = False) -> dict:
         forecasts = []
 
     open_positions = _load_open_positions(conn)
+    settlement_results = _settle_expired_positions(conn, open_positions)
 
     summary = brain.run_cycle(
         markets=markets,
         forecasts=forecasts,
         open_positions=open_positions,
+        settlement_results=settlement_results,
     )
     return summary
 
@@ -189,7 +421,8 @@ def _post_last_cycle(summary: dict, port: int = 5001) -> None:
         pass  # dashboard may not be running
 
 
-def autoloop(interval_seconds: int = 300, paper: bool = True, live: bool = False) -> None:
+def autoloop(interval_seconds: int | None = None, paper: bool = True, live: bool = False) -> None:
+    interval_seconds = interval_seconds or int(os.environ.get("POLL_INTERVAL_S", 300))
     mode = "live" if live else "paper"
     print(f"[main] Starting autoloop (interval={interval_seconds}s, mode={mode})")
     while True:
@@ -253,8 +486,8 @@ if __name__ == "__main__":
                         help="Execute real trades (requires API keys)")
     parser.add_argument("--loop", action="store_true",
                         help="Run in continuous loop")
-    parser.add_argument("--interval", type=int, default=300,
-                        help="Loop interval in seconds (default: 300)")
+    parser.add_argument("--interval", type=int, default=None,
+                        help="Loop interval in seconds (default: POLL_INTERVAL_S from .env or 300)")
     parser.add_argument("--calibrate", action="store_true",
                         help="Run calibration cycle and exit")
     parser.add_argument("--dashboard", action="store_true",
@@ -263,10 +496,18 @@ if __name__ == "__main__":
                         help="Dashboard port (default: 5001)")
     parser.add_argument("--autoresearch", action="store_true",
                         help="Run one autoresearch experiment cycle")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="Test all APIs and DB connectivity")
+    parser.add_argument("--status", action="store_true",
+                        help="Show portfolio + open positions, no trading")
     args = parser.parse_args()
 
     if args.dashboard:
         run_dashboard(port=args.port)
+    elif args.diagnose:
+        run_diagnose()
+    elif args.status:
+        run_status()
     elif args.autoresearch:
         run_autoresearch()
     elif args.calibrate:

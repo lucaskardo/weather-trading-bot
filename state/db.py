@@ -218,6 +218,13 @@ def init_db(path: Path | None = None) -> sqlite3.Connection:
             completed_at  TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS promoted_params (
+            key        TEXT PRIMARY KEY,
+            value      REAL NOT NULL,
+            source_exp TEXT,
+            promoted_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
         INSERT OR IGNORE INTO portfolio (id, bankroll, cash_available, total_pnl)
         VALUES (1, 1000.0, 1000.0, 0.0);
     """)

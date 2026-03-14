@@ -20,7 +20,7 @@ from typing import Any, Optional
 
 import requests
 
-KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_BASE = "https://trading-api.kalshi.com/trade-api/v2"
 
 WEATHER_SERIES = [
     "KXHIGHNY", "KXHIGHCHI", "KXHIGHLA", "KXHIGHDC",

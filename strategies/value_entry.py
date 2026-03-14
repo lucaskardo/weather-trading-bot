@@ -23,7 +23,7 @@ from core.forecaster import (
     compute_fair_value,
     _compute_fair_value_for_market,  # re-exported for backward compatibility
 )
-from execution.orderbook import OrderbookLevel, get_executable_price
+from execution.orderbook import OrderbookLevel, get_executable_price, get_exit_price
 from shared.params import Params, PARAMS
 from shared.types import ModelForecast
 from strategies.base import BaseStrategy, Signal
@@ -247,11 +247,12 @@ class ValueEntryStrategy(BaseStrategy):
         open_positions: list[dict[str, Any]],
         forecasts: list[ModelForecast],
         params: Params = PARAMS,
+        conn: Any = None,
     ) -> list[dict[str, Any]]:
         actions: list[dict[str, Any]] = []
 
         for pos in open_positions:
-            action = self._check_exit(pos, forecasts, params)
+            action = self._check_exit(pos, forecasts, params, conn=conn)
             actions.append(action)
 
         return actions
@@ -261,6 +262,7 @@ class ValueEntryStrategy(BaseStrategy):
         pos: dict[str, Any],
         forecasts: list[ModelForecast],
         params: Params,
+        conn: Any = None,
     ) -> dict[str, Any]:
         position_id = pos.get("id")
         city = pos.get("city", "")
@@ -271,25 +273,28 @@ class ValueEntryStrategy(BaseStrategy):
         high_f = pos.get("high_f")
         low_f = pos.get("low_f")
         market_type = pos.get("market_type", "above")
-        opened_at_str = pos.get("opened_at", "")
 
         # Compute fair value using the canonical pipeline (analytic, no MC noise)
+        # Pass conn so bias correction uses the same table as the entry model
         fair_value, consensus_f, _, n_models = compute_fair_value(
             forecasts, city, target_date, market_type, high_f, low_f, params,
-            use_mc=False,
+            conn=conn, use_mc=False,
         )
+
+        # Net liquidation price accounts for slippage + fees (honest exit cost)
+        net_exit = get_exit_price(current_price, side, params)
 
         # --- Rule 1: Forecast reversal ---
         if fair_value is not None and n_models > 0:
             if side == "YES":
-                updated_edge = fair_value - current_price
+                updated_edge = fair_value - net_exit
             else:
-                updated_edge = (1 - fair_value) - (1 - current_price)
+                updated_edge = (1 - fair_value) - (1 - net_exit)
             if updated_edge < -0.05:
                 return {"position_id": position_id, "action": "exit", "reason": "forecast_reversal"}
 
         # --- Rule 2: Convergence ---
-        if fair_value is not None and abs(current_price - fair_value) < 0.03:
+        if fair_value is not None and abs(net_exit - fair_value) < 0.03:
             return {"position_id": position_id, "action": "exit", "reason": "convergence"}
 
         # --- Rule 3: Stale forecast ---

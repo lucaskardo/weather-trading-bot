@@ -45,6 +45,20 @@ _COMBO_PROPOSALS: list[list[str]] = [
 ]
 
 
+def load_promoted_params(conn: sqlite3.Connection, params: Params) -> None:
+    """
+    Apply any previously promoted params from the DB onto a Params instance.
+
+    Called at startup so winning experiment parameters survive restarts without
+    ever mutating the module-level PARAMS singleton at experiment time.
+    """
+    rows = conn.execute("SELECT key, value FROM promoted_params").fetchall()
+    for row in rows:
+        key, value = row["key"], row["value"]
+        if hasattr(params, key):
+            setattr(params, key, value)
+
+
 class ExperimentRegistry:
     """
     Manages parameter experiments with walk-forward validation.
@@ -190,9 +204,10 @@ class ExperimentRegistry:
 
     def promote_if_better(self, experiment_id: str) -> bool:
         """
-        If experiment beats baseline by >PROMOTION_THRESHOLD, apply params.
+        If experiment beats baseline by >PROMOTION_THRESHOLD, persist params to DB.
 
-        Modifies self.params in-place and marks experiment as 'promoted'.
+        Params are stored in the promoted_params table and loaded at startup.
+        The global PARAMS singleton is never mutated directly.
 
         Returns:
             True if promoted, False otherwise.
@@ -206,10 +221,16 @@ class ExperimentRegistry:
         ).fetchone()
         candidate = json.loads(row["params_json"])
 
-        # Apply to live params
+        # Persist to DB — never setattr on the singleton
+        now = datetime.now(timezone.utc).isoformat()
         for key, value in candidate.items():
             if hasattr(self.params, key):
-                setattr(self.params, key, value)
+                self.conn.execute(
+                    """INSERT OR REPLACE INTO promoted_params
+                       (key, value, source_exp, promoted_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (key, float(value), experiment_id, now),
+                )
 
         self.conn.execute(
             "UPDATE experiments SET status='promoted' WHERE id=?", (experiment_id,)
