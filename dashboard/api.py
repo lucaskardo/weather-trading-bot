@@ -94,6 +94,26 @@ def positions():
     ))
 
 
+@app.route("/api/daily_pnl")
+def daily_pnl():
+    """Daily PnL history with running cumulative total."""
+    return jsonify(_rows(
+        """SELECT
+               date,
+               realized_pnl,
+               num_trades,
+               num_wins,
+               CASE WHEN num_trades > 0
+                    THEN ROUND(num_wins * 1.0 / num_trades, 3)
+                    ELSE NULL END as win_rate,
+               SUM(realized_pnl) OVER (ORDER BY date ROWS UNBOUNDED PRECEDING)
+                    as cumulative_pnl
+           FROM daily_pnl
+           ORDER BY date DESC
+           LIMIT 90"""
+    ))
+
+
 @app.route("/api/trades/recent")
 def recent_trades():
     limit = int(request.args.get("limit", 50))
@@ -316,27 +336,39 @@ def update_last_cycle():
 
 @app.route("/api/quick_stats")
 def quick_stats():
-    portfolio = _one("SELECT * FROM portfolio WHERE id=1")
-    open_count = _one("SELECT COUNT(*) as n FROM positions WHERE status NOT IN "
-                      "('WON','LOST','EXITED_CONVERGENCE','EXITED_STOP','EXITED_PRE_SETTLEMENT')")
-    closed_count = _one("SELECT COUNT(*) as n FROM positions WHERE realized_pnl IS NOT NULL")
-    win_count = _one("SELECT COUNT(*) as n FROM positions WHERE realized_pnl > 0")
-    total_pnl = _one("SELECT SUM(realized_pnl) as total FROM positions WHERE realized_pnl IS NOT NULL")
-    exp_count = _one("SELECT COUNT(*) as n FROM experiments")
-    return jsonify({
-        "bankroll": portfolio.get("bankroll"),
-        "total_pnl": portfolio.get("total_pnl"),
-        "open_positions": open_count.get("n", 0),
-        "closed_positions": closed_count.get("n", 0),
-        "winning_positions": win_count.get("n", 0),
-        "win_rate": (
-            round(win_count.get("n", 0) / closed_count["n"], 3)
-            if closed_count.get("n") else None
-        ),
-        "realized_pnl": total_pnl.get("total"),
-        "experiments_run": exp_count.get("n", 0),
-        "last_cycle": _LAST_CYCLE,
-    })
+    row = _one("""
+        SELECT
+            p.bankroll,
+            p.total_pnl,
+            (SELECT COUNT(*) FROM positions WHERE status NOT IN
+                ('WON','LOST','EXITED_CONVERGENCE','EXITED_STOP','EXITED_PRE_SETTLEMENT')
+            ) as open_positions,
+            (SELECT COUNT(*) FROM positions WHERE DATE(opened_at) = DATE('now')
+            ) as trades_today,
+            (SELECT COALESCE(SUM(realized_pnl), 0) FROM positions
+             WHERE DATE(closed_at) = DATE('now') AND realized_pnl IS NOT NULL
+            ) as daily_pnl,
+            (SELECT ROUND(AVG(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0.0 END) * 100, 1)
+             FROM positions WHERE realized_pnl IS NOT NULL
+               AND closed_at > datetime('now', '-30 days')
+            ) as win_rate_30d,
+            (SELECT COUNT(*) FROM positions WHERE realized_pnl IS NOT NULL
+            ) as closed_positions,
+            (SELECT COUNT(*) FROM positions WHERE realized_pnl > 0
+            ) as winning_positions,
+            (SELECT COALESCE(SUM(realized_pnl), 0) FROM positions
+             WHERE realized_pnl IS NOT NULL
+            ) as realized_pnl,
+            (SELECT COUNT(*) FROM experiments
+            ) as experiments_run
+        FROM portfolio p WHERE p.id = 1
+    """)
+    row["last_cycle"] = _LAST_CYCLE
+    # Derived win_rate for backward compat
+    closed = row.get("closed_positions") or 0
+    winning = row.get("winning_positions") or 0
+    row["win_rate"] = round(winning / closed, 3) if closed else None
+    return jsonify(row)
 
 
 # --------------------------------------------------------------------------- #

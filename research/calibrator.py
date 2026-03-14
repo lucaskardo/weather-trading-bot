@@ -24,7 +24,7 @@ from typing import Any
 from clients.nws_settlement import fetch_settlement, SettlementError
 from core.forecaster import (
     brier_decomposition, prob_above_threshold,
-    _compute_fair_value_for_market, temperature_scale,
+    _compute_fair_value_for_market, temperature_scale, compute_fair_value,
 )
 from research.walk_forward import walk_forward_brier
 from research.optimizer import optimize_params, save_params, OptimizerResult
@@ -124,16 +124,25 @@ def run_calibration(
             market_type = t.get("market_type") or "above"
             high_f = t.get("high_f") or t.get("threshold_f")
             low_f = t.get("low_f")
-            raw_pred = _compute_fair_value_for_market(
-                t["consensus_f"], market_type,
+            # Use the same math the live strategy uses: dynamic_std + temp_scaling
+            # No conn → no bias correction (we're testing parameter sensitivity, not bias)
+            from shared.types import ModelForecast
+            fake_forecast = ModelForecast(
+                city=t.get("city", ""),
+                target_date=t.get("target_date", ""),
+                model_name="consensus",
+                predicted_high_f=float(t["consensus_f"]),
+            )
+            fv, _, _, _ = compute_fair_value(
+                [fake_forecast],
+                t.get("city", ""), t.get("target_date", ""),
+                market_type,
                 float(high_f) if high_f is not None else None,
                 float(low_f) if low_f is not None else None,
-                params.base_std_f,
+                params,
+                conn=None, use_mc=False,
             )
-            if raw_pred is not None:
-                pred = temperature_scale(raw_pred, params.temp_scaling_T)
-            else:
-                pred = t.get("fair_value", 0.5) or 0.5
+            pred = fv if fv is not None else (t.get("fair_value", 0.5) or 0.5)
         else:
             # Fallback: use stored fair_value (the prediction made at entry time)
             pred = t.get("fair_value", 0.5) or 0.5
@@ -156,18 +165,14 @@ def run_calibration(
 
     new_params = opt_result.best_params
 
-    # Step 5: Apply temperature scaling (update params in-place)
-    params.base_std_f = new_params.get("base_std_f", params.base_std_f)
-    params.temp_scaling_T = new_params.get("temp_T", params.temp_scaling_T)
-
-    # Step 6: Persist
+    # Step 5: Persist (never mutate the passed params — caller decides what to apply)
     if save:
         _save_to_db(conn, decomp, new_params)
         save_params(new_params, params_path)
 
     _log(
-        f"[calibrator] updated params: base_std_f={params.base_std_f:.2f} "
-        f"temp_T={params.temp_scaling_T:.3f}"
+        f"[calibrator] optimised params: base_std_f={new_params.get('base_std_f', params.base_std_f):.2f} "
+        f"temp_T={new_params.get('temp_T', params.temp_scaling_T):.3f}"
     )
 
     return CalibrationResult(

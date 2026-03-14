@@ -46,6 +46,8 @@ def startup_checks(conn) -> None:
 
 def _load_promoted_params(conn) -> None:
     """Apply any previously promoted experiment params from the DB."""
+    # NOTE: intentionally mutates PARAMS at startup only — this is the single
+    # controlled point where promoted params are applied to the session singleton.
     try:
         from research.autoresearch import load_promoted_params
         load_promoted_params(conn, PARAMS)
@@ -441,10 +443,22 @@ def autoloop(interval_seconds: int | None = None, paper: bool = True, live: bool
 
 def run_calibrate() -> None:
     """Run the calibration pipeline."""
+    from dataclasses import replace
     from research.calibrator import run_calibration
     conn = init_db()
     result = run_calibration(conn, PARAMS)
-    print(f"[calibrate] done: {result}")
+    # Apply optimised values to a copy — never mutate the global singleton here
+    if result.new_params:
+        calibrated = replace(
+            PARAMS,
+            base_std_f=result.new_params.get("base_std_f", PARAMS.base_std_f),
+            temp_scaling_T=result.new_params.get("temp_T", PARAMS.temp_scaling_T),
+        )
+        print(f"[calibrate] done: {result}")
+        print(f"[calibrate] calibrated params: base_std_f={calibrated.base_std_f:.2f} "
+              f"temp_T={calibrated.temp_scaling_T:.3f}")
+    else:
+        print(f"[calibrate] done: {result}")
 
 
 def run_autoresearch() -> None:

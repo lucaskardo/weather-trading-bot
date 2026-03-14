@@ -7,6 +7,7 @@
   <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh; }
@@ -159,6 +160,85 @@ function LastCyclePanel() {
   );
 }
 
+// ─── Chart helpers ───────────────────────────────────────────────────────────
+function BankrollChart({ daily }) {
+  const ref = React.useRef(null);
+  const chartRef = React.useRef(null);
+
+  React.useEffect(() => {
+    if (!daily || daily.length === 0 || !ref.current) return;
+    const sorted = [...daily].reverse();
+    const labels = sorted.map(d => d.date);
+    const values = sorted.map(d => d.cumulative_pnl ?? 0);
+
+    if (chartRef.current) chartRef.current.destroy();
+    chartRef.current = new Chart(ref.current, {
+      type: "line",
+      data: {
+        labels,
+        datasets: [{
+          label: "Cumulative P&L ($)",
+          data: values,
+          borderColor: "#63b3ed",
+          backgroundColor: "rgba(99,179,237,0.1)",
+          fill: true,
+          tension: 0.3,
+          pointRadius: 3,
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: "#718096", maxTicksLimit: 10 }, grid: { color: "#1e2433" } },
+          y: { ticks: { color: "#718096" }, grid: { color: "#1e2433" } },
+        }
+      }
+    });
+    return () => { if (chartRef.current) chartRef.current.destroy(); };
+  }, [daily]);
+
+  if (!daily || daily.length === 0) return <div className="stat-sub">No P&L history yet</div>;
+  return <canvas ref={ref} height={120} />;
+}
+
+function DailyBarsChart({ daily }) {
+  const ref = React.useRef(null);
+  const chartRef = React.useRef(null);
+
+  React.useEffect(() => {
+    if (!daily || daily.length === 0 || !ref.current) return;
+    const sorted = [...daily].reverse().slice(-30);
+    const labels = sorted.map(d => d.date.slice(5));
+    const wins = sorted.map(d => d.num_wins ?? 0);
+    const losses = sorted.map(d => Math.max(0, (d.num_trades ?? 0) - (d.num_wins ?? 0)));
+
+    if (chartRef.current) chartRef.current.destroy();
+    chartRef.current = new Chart(ref.current, {
+      type: "bar",
+      data: {
+        labels,
+        datasets: [
+          { label: "Wins", data: wins, backgroundColor: "#68d391", stack: "s" },
+          { label: "Losses", data: losses, backgroundColor: "#fc8181", stack: "s" },
+        ]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { labels: { color: "#a0aec0" } } },
+        scales: {
+          x: { stacked: true, ticks: { color: "#718096" }, grid: { color: "#1e2433" } },
+          y: { stacked: true, ticks: { color: "#718096" }, grid: { color: "#1e2433" } },
+        }
+      }
+    });
+    return () => { if (chartRef.current) chartRef.current.destroy(); };
+  }, [daily]);
+
+  if (!daily || daily.length === 0) return <div className="stat-sub">No trade history yet</div>;
+  return <canvas ref={ref} height={120} />;
+}
+
 // ─── Tab 1: Live Trading ────────────────────────────────────────────────────
 function Tab1() {
   const { data: portfolio } = useApi("/portfolio");
@@ -166,6 +246,8 @@ function Tab1() {
   const { data: recent } = useApi("/trades/recent?limit=20");
   const { data: allocations } = useApi("/allocations");
   const { data: clusters } = useApi("/cluster_exposure");
+  const { data: qs } = useApi("/quick_stats");
+  const { data: daily } = useApi("/daily_pnl");
 
   const bankroll = portfolio?.bankroll ?? 0;
   const totalPnl = portfolio?.total_pnl ?? 0;
@@ -181,19 +263,31 @@ function Tab1() {
           <div className="stat-sub">Available capital</div>
         </div>
         <div className="card">
-          <h3>Total P&L</h3>
-          <div className="stat-value">{fmtPnl(totalPnl)}</div>
-          <div className="stat-sub">All time</div>
+          <h3>Today's P&L</h3>
+          <div className="stat-value">{fmtPnl(qs?.daily_pnl)}</div>
+          <div className="stat-sub">{qs?.trades_today ?? 0} trades today</div>
+        </div>
+        <div className="card">
+          <h3>Win Rate (30d)</h3>
+          <div className="stat-value">{qs?.win_rate_30d != null ? qs.win_rate_30d + "%" : "—"}</div>
+          <div className="stat-sub">Last 30 days</div>
         </div>
         <div className="card">
           <h3>Open Positions</h3>
           <div className="stat-value">{positions?.length ?? "—"}</div>
-          <div className="stat-sub">Across all strategies</div>
+          <div className="stat-sub">${fmt(positions?.reduce((s, p) => s + (p.size_usd || 0), 0) ?? 0)} exposure</div>
+        </div>
+      </div>
+
+      {/* Charts row */}
+      <div className="grid grid-2">
+        <div className="card">
+          <h3>Cumulative P&L</h3>
+          <BankrollChart daily={daily} />
         </div>
         <div className="card">
-          <h3>Exposure</h3>
-          <div className="stat-value">${fmt(positions?.reduce((s, p) => s + (p.size_usd || 0), 0) ?? 0)}</div>
-          <div className="stat-sub">Total open notional</div>
+          <h3>Daily Wins / Losses (last 30 days)</h3>
+          <DailyBarsChart daily={daily} />
         </div>
       </div>
 

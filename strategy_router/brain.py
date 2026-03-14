@@ -132,7 +132,7 @@ class Brain:
         # Step 2: Manage existing positions
         # ------------------------------------------------------------------ #
         lifecycle_actions = run_lifecycle_cycle(
-            positions, forecasts, settlement_results, self.params
+            positions, forecasts, settlement_results, self.params, conn=self.conn
         )
         exits = [a for a in lifecycle_actions if a.should_execute]
         _log(f"[brain] {len(exits)} exit(s) triggered this cycle")
@@ -264,11 +264,22 @@ class Brain:
             ),
         )
 
-        # Return capital (size_usd) + PnL to bankroll
+        # Return capital (size_usd) + PnL to bankroll, sync cash_available
         returned = size_usd + realized_pnl
         self.conn.execute(
             "UPDATE portfolio SET bankroll = bankroll + ?, updated_at=? WHERE id=1",
             (returned, now),
+        )
+        self.conn.execute(
+            """UPDATE portfolio SET
+               cash_available = bankroll - (
+                   SELECT COALESCE(SUM(size_usd), 0) FROM positions
+                   WHERE status NOT IN ('WON','LOST','EXITED_CONVERGENCE',
+                                        'EXITED_STOP','EXITED_PRE_SETTLEMENT')
+               ),
+               updated_at = ?
+               WHERE id = 1""",
+            (now,)
         )
 
         # Log to daily_pnl
@@ -388,10 +399,21 @@ class Brain:
              fees_paid, fill.get("execution_type", "taker"), now),
         )
 
-        # Deduct from bankroll
+        # Deduct from bankroll, sync cash_available
         self.conn.execute(
             "UPDATE portfolio SET bankroll = bankroll - ?, updated_at=? WHERE id=1",
             (size_usd, now),
+        )
+        self.conn.execute(
+            """UPDATE portfolio SET
+               cash_available = bankroll - (
+                   SELECT COALESCE(SUM(size_usd), 0) FROM positions
+                   WHERE status NOT IN ('WON','LOST','EXITED_CONVERGENCE',
+                                        'EXITED_STOP','EXITED_PRE_SETTLEMENT')
+               ),
+               updated_at = ?
+               WHERE id = 1""",
+            (now,)
         )
         self.conn.commit()
 

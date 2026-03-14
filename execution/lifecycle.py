@@ -88,6 +88,7 @@ def process_position(
     forecasts: list[ModelForecast],
     settlement_result: Optional[dict[str, Any]] = None,
     params: Params = PARAMS,
+    conn: Any = None,
 ) -> LifecycleAction:
     """
     Evaluate a single position and return the appropriate lifecycle action.
@@ -157,7 +158,7 @@ def process_position(
 
     # --- Compute updated edge from latest forecasts ---
     updated_fair_value = _compute_fair_value(
-        forecasts, city, target_date, high_f, params, market_type, low_f
+        forecasts, city, target_date, high_f, params, market_type, low_f, conn=conn
     )
 
     # --- Exit Rule 1: Stale forecast (check before trusting forecast values) ---
@@ -234,6 +235,7 @@ def run_lifecycle_cycle(
     forecasts: list[ModelForecast],
     settlement_results: Optional[dict[int, dict[str, Any]]] = None,
     params: Params = PARAMS,
+    conn: Any = None,
 ) -> list[LifecycleAction]:
     """
     Process all open positions in one cycle.
@@ -243,6 +245,7 @@ def run_lifecycle_cycle(
         forecasts:         Latest model forecasts.
         settlement_results: Map of position_id → settlement result dict.
         params:            Trading parameters.
+        conn:              SQLite connection for bias correction.
 
     Returns:
         List of LifecycleAction, one per position.
@@ -252,7 +255,7 @@ def run_lifecycle_cycle(
 
     for pos in open_positions:
         settlement = sr.get(pos.get("id"))
-        action = process_position(pos, forecasts, settlement, params)
+        action = process_position(pos, forecasts, settlement, params, conn=conn)
         results.append(action)
 
     return results
@@ -278,11 +281,12 @@ def _compute_fair_value(
     params: Params,
     market_type: str = "above",
     low_f: Optional[float] = None,
+    conn: Any = None,
 ) -> Optional[float]:
     from core.forecaster import compute_fair_value
     fair_value, _, _, _ = compute_fair_value(
         forecasts, city, target_date, market_type, high_f, low_f, params,
-        use_mc=False,
+        conn=conn, use_mc=False,
     )
     return fair_value
 

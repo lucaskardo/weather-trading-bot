@@ -43,8 +43,8 @@ def _db(tmp_path: Path) -> sqlite3.Connection:
 
 
 def _params(**kw) -> Params:
-    import copy
-    p = copy.copy(PARAMS)
+    # Use Params() directly so a mutated PARAMS singleton never bleeds into tests
+    p = Params()
     for k, v in kw.items():
         setattr(p, k, v)
     return p
