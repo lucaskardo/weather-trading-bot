@@ -1,534 +1,532 @@
-# weather-trading-bot
+# Weather Trading Bot
 
-A production-grade, self-improving weather prediction market trading bot for **Kalshi** and **Polymarket**.
-
-Fetches live weather markets, runs multi-model temperature forecasts through a calibrated probability engine, routes capital across competing strategies using a scorecard system, and continuously improves itself through walk-forward backtesting and an autoresearch loop. Ships with a real-time React dashboard and full paper-trading mode so you can watch it work before risking capital.
+An automated trading bot for weather prediction markets on [Kalshi](https://kalshi.com) and [Polymarket](https://polymarket.com). It fetches real-time weather forecasts, computes edge against market prices using a probabilistic model, manages positions with a full lifecycle engine, and continuously self-improves via autoresearch.
 
 ---
 
-## Quick Start
+## Table of Contents
 
-```bash
-git clone git@github.com:lucaskardo/weather-trading-bot.git
-cd weather-trading-bot
-
-pip install -r requirements.txt
-
-cp .env.example .env
-# Add your NOAA_CDO_TOKEN (free) at minimum
-
-# Paper trade with real market data
-python main.py --paper
-
-# Continuous paper trading loop (every 5 minutes)
-python main.py --paper --loop
-
-# Open the dashboard in a second terminal
-python main.py --dashboard
-# Then open dashboard/index.html in your browser
-```
+1. [How It Works](#how-it-works)
+2. [Architecture](#architecture)
+3. [Installation](#installation)
+4. [Configuration (.env)](#configuration-env)
+5. [Paper Trading](#paper-trading)
+6. [Live Trading (Kalshi)](#live-trading-kalshi)
+7. [Dashboard](#dashboard)
+8. [Commands Reference](#commands-reference)
+9. [Strategies](#strategies)
+10. [Risk Management](#risk-management)
+11. [Autoresearch & Calibration](#autoresearch--calibration)
+12. [Project Structure](#project-structure)
+13. [Running Tests](#running-tests)
 
 ---
 
-## What It Does
+## How It Works
 
-Every cycle the bot:
+Each trading cycle (default: every 5 minutes):
 
-1. **Fetches live markets** from Kalshi (8 US city series) and Polymarket (weather tag) — **persists them to DB immediately** so market_id is never NULL
-2. **Pulls 5-model weather forecasts** — GFS, ECMWF, ICON, AROME, NOAA/NWS — with full run lineage
-3. **Applies bias correction** — per-city, per-model offsets learned from historical residuals, integrated directly into signal generation
-4. **Computes calibrated probabilities** — Gaussian CDF with **dynamic forecast uncertainty** (scales with model spread, lead time, and season) + Platt temperature scaling, optimized weekly via walk-forward Brier scoring
-5. **Calculates executable edge** — VWAP through the real orderbook, Kalshi's price-dependent fee schedule, slippage buffer
-6. **Routes capital** — softmax allocation across strategies, capped [5%–40%] per strategy, half-Kelly position sizing
-7. **Executes via abstracted executor** — `PaperExecutor` (default) or `KalshiExecutor` (live), swappable without touching strategy code
-8. **Enforces risk guards** — stale data halt, cluster cap, daily loss limit, city position limit
-9. **Logs everything** to SQLite — predictions, positions with **full entry snapshots** (high_f, consensus_f, edge, market_id), forecasts, settlement data, experiments
-10. **Self-improves** — autoresearch loop proposes single or combo parameter variants across 5-param search space, validates out-of-sample, promotes winners
+1. **Fetch markets** — pulls open weather contracts from Kalshi and Polymarket
+2. **Fetch forecasts** — pulls multi-model weather forecasts (Open-Meteo: GFS, ECMWF, etc.) for each city/date pair
+3. **Compute fair value** — runs a Monte Carlo probability engine with bias correction and Platt temperature scaling to price each contract
+4. **Generate signals** — four strategies evaluate edge, confidence, and risk filters
+5. **Route capital** — a scorecard allocates budget per strategy based on Sharpe, Brier score, execution quality, and drawdown
+6. **Manage positions** — exits positions on convergence, stop-loss, or pre-settlement; settles expired contracts via NWS/IEM data
+7. **Log everything** — all signals, orders, fills, and PnL written to SQLite
 
 ---
 
 ## Architecture
 
 ```
-weather-trading-bot/
-│
-├── main.py                          # Entry point — all CLI modes
-│
-├── clients/
-│   ├── kalshi_client.py             # Kalshi REST API — markets, orderbooks, ticker parsing
-│   ├── polymarket_client.py         # Polymarket Gamma API — weather market discovery
-│   ├── weather.py                   # 5-model Open-Meteo fetcher with run_id lineage
-│   ├── hrrr.py                      # HRRR hourly nowcast for same-day contracts
-│   └── nws_settlement.py            # Official NWS settlement (NOAA CDO + IEM ASOS fallback)
-│
-├── core/
-│   ├── forecaster.py                # Temperature scaling, Brier decomposition, prob_above_threshold, dynamic_std_f
-│   └── signals.py                   # Edge calculation, executable edge, opportunity ranking
-│
-├── execution/
-│   ├── exchange_executor.py         # ExchangeExecutor ABC, PaperExecutor, KalshiExecutor
-│   ├── orderbook.py                 # VWAP pricing, Kalshi fee schedule, slippage model
-│   └── lifecycle.py                 # Position state machine (OPENED → HOLDING → terminal)
-│
-├── strategies/
-│   ├── base.py                      # Signal dataclass + BaseStrategy ABC
-│   ├── value_entry.py               # LIVE: calibrated-edge entry, 4-rule exit logic
-│   ├── convergence_exit.py          # SHADOW: exit when price converges to fair value
-│   ├── model_release.py             # SHADOW: enter on large GFS/ECMWF revision (≥3°F)
-│   ├── disagreement.py              # SHADOW: enter on large inter-model spread (≥4°F)
-│   ├── shadow_logger.py             # Persist shadow signals, settle hypothetical PnL
-│   ├── promotion.py                 # Scan shadows for promotion (score > 75, ≥50 trades)
-│   └── analytics.py                 # Per-trade MFE, MAE, hold time, cluster, edge lineage
+main.py                  ← entry point, CLI flags, cycle orchestration
 │
 ├── strategy_router/
-│   ├── scorecard.py                 # Weighted composite: Sharpe(35%) Brier(30%) Exec(20%) DD(10%) Instability(5%)
-│   ├── allocator.py                 # Capped softmax allocator [5%–40%], iterative redistribution
-│   ├── selector.py                  # 5-gate filter + half-Kelly sizing
-│   └── brain.py                     # Cycle orchestrator — wires all modules together
+│   ├── brain.py         ← orchestrates one full cycle
+│   ├── scorecard.py     ← per-strategy scoring (Sharpe, Brier, etc.)
+│   ├── allocator.py     ← softmax capital allocation
+│   └── selector.py      ← signal filtering, Kelly sizing, budget tracking
+│
+├── strategies/
+│   ├── value_entry.py   ← core fair-value entry + convergence exit
+│   ├── convergence_exit.py
+│   ├── model_release.py ← trade on new forecast model releases
+│   └── disagreement.py  ← trade when models disagree with market
+│
+├── core/
+│   ├── forecaster.py    ← canonical fair value pipeline (bias + MC + scaling)
+│   └── signals.py
+│
+├── clients/
+│   ├── kalshi_client.py ← Kalshi REST API
+│   ├── polymarket_client.py
+│   ├── weather.py       ← Open-Meteo multi-model fetcher + DB store
+│   └── nws_settlement.py← NWS/IEM settlement price fetcher
+│
+├── execution/
+│   ├── exchange_executor.py ← PaperExecutor / KalshiExecutor
+│   ├── lifecycle.py     ← position exit engine (convergence, stop, pre-settle)
+│   └── orderbook.py     ← fee/slippage math
 │
 ├── risk/
-│   ├── guards.py                    # StaleDataHalt, ClusterCapExceeded, DailyLossHalt
-│   └── reconciliation.py            # Bidirectional local DB ↔ exchange reconciliation
+│   ├── guards.py        ← stale-data halt, cluster cap, daily loss limit
+│   └── reconciliation.py
 │
 ├── research/
-│   ├── walk_forward.py              # Time-series CV, out-of-sample Brier per fold
-│   ├── optimizer.py                 # Differential evolution (scipy) + coordinate-descent fallback
-│   ├── calibrator.py                # Full pipeline: resolve → Brier → optimize → save
-│   ├── bias_correction.py           # Per-(city, model) bias learning from historical residuals
-│   └── autoresearch.py              # ExperimentRegistry: propose → run → compare → promote
+│   ├── calibrator.py    ← walk-forward Brier + temperature scaling optimizer
+│   ├── autoresearch.py  ← automated experiment proposal + promotion
+│   ├── walk_forward.py  ← walk-forward backtester
+│   └── bias_correction.py
 │
-├── state/
-│   └── db.py                        # SQLite WAL-mode, 9 tables, transaction context manager
-│
-├── shared/
-│   ├── params.py                    # All tuneable parameters + geographic cluster definitions
-│   └── types.py                     # ModelForecast, ConsensusForecast with lineage fields
-│
-├── dashboard/
-│   ├── api.py                       # Flask micro-server — 17 REST endpoints
-│   └── index.html                   # React single-file dashboard — 4 tabs, QuickStats bar, no build step
-│
-└── tests/                           # 440 tests, 2 skipped (scipy optional)
-    ├── test_db.py
-    ├── test_nws_settlement.py
-    ├── test_executable_edge.py
-    ├── test_forecast_lineage.py
-    ├── test_strategies.py
-    ├── test_router.py
-    ├── test_risk_guards.py
-    ├── test_research.py
-    ├── test_shadow.py
-    ├── test_kalshi_client.py
-    ├── test_polymarket_client.py
-    └── test_phase_b.py
+├── state/db.py          ← SQLite schema, WAL mode, migrations
+├── shared/params.py     ← all tunable constants (Params dataclass)
+└── dashboard/
+    ├── api.py           ← Flask REST API (reads bot.db)
+    └── index.html       ← single-file React dashboard
 ```
 
 ---
 
-## Core Concepts
+## Installation
 
-### Executable Edge
-
-The bot never trades on raw model-vs-market spread. Every signal must survive the full cost stack:
-
-```
-executable_price = VWAP(orderbook, target_size)
-                 + slippage_buffer             # configurable, default 1¢
-                 + kalshi_fee(price)           # price-dependent: peaks ~3.5% at 50¢
-
-executable_edge  = model_prob - executable_price
-```
-
-Only signals with `executable_edge ≥ min_executable_edge` AND `orderbook_depth ≥ min_depth_usd` pass.
-
-### Kalshi Fee Schedule (Feb 2026)
-
-Unlike a flat fee, Kalshi charges based on `min(price, 1-price)`:
-
-| Contract price | Effective cost bracket | Fee rate |
-|---|---|---|
-| 1–9¢ / 91–99¢ | 1–9¢ | 3.5% |
-| 10–24¢ / 76–90¢ | 10–24¢ | 5.0% |
-| 25–50¢ | 25–50¢ | 7.0% (peak) |
-
-Near-50¢ contracts that look profitable on raw edge often aren't after fees. This is modeled exactly.
-
-### Probability Model
-
-```
-raw_prob = 1 - CDF((threshold_f - consensus_f) / dynamic_std_f)
-scaled   = sigmoid(logit(raw_prob) / T)
-```
-
-- `consensus_f` = confidence-weighted average of de-biased model forecasts
-- `dynamic_std_f` replaces the static `base_std_f` — adjusts uncertainty upward for high model spread, long lead times, and summer contracts (see below)
-- `T` (temperature) calibrated alongside `base_std_f`
-- Logit clamped to `[-30, 30]`, output to `(1e-6, 1-1e-6)`
-
-### Dynamic Forecast Uncertainty
-
-Static uncertainty (`base_std_f = 5.0°F` for all cities and lead times) underestimates risk in high-disagreement or long-range scenarios. `dynamic_std_f()` scales it up based on three factors:
-
-```
-std = base_std_f
-    + min(3.0, (lead_days - 1) × 0.5)   # +0.5°F per day beyond 24h, capped at +3°F
-    + 0.3 × model_spread                 # 30% of inter-model std-dev
-    × 1.15 if summer (Jun–Aug)           # seasonal variance boost
-```
-
-This makes the bot systematically more conservative on week-ahead contracts and high-disagreement markets.
-
-### Bias Correction
-
-Every model has systematic errors that vary by city and season. The bot learns these automatically:
-
-```
-bias(city, model) = mean(predicted_high_f - actual_high_f)   # over ≥10 resolved pairs
-corrected_high_f  = predicted_high_f - bias
-```
-
-After ~50 resolved trades per city/model, the probability engine is materially better calibrated.
-
-### Strategy Router
-
-Strategies compete for capital through a scorecard:
-
-| Component | Weight | Measures |
-|---|---|---|
-| Sharpe ratio | 35% | Risk-adjusted return consistency |
-| Brier score | 30% | Forecast calibration quality |
-| Execution quality | 20% | Edge realized vs. edge expected |
-| Max drawdown | 10% | Worst peak-to-trough loss |
-| Parameter instability | 5% | How much params change between calibrations |
-
-Capital is allocated via capped softmax (min 5%, max 40% per strategy). When all strategies simultaneously hit the upper cap, the bot correctly caps total deployment rather than over-normalizing.
-
-### Shadow Competition
-
-All three non-live strategies run in shadow mode — they generate signals, log predictions, and receive hypothetical PnL at settlement, but never touch real capital. Promotion requires:
-
-- `trade_count ≥ 50` resolved shadow trades
-- `scorecard > 75` (out of 100)
-- **Human review** — the bot flags candidates and writes to `strategy_metrics`, never auto-promotes
-
-### HRRR Intraday Nowcast
-
-For same-day temperature contracts, HRRR updates hourly at 3km resolution. The bot combines:
-
-```
-hrrr_high_f = max(observed_max_so_far, hrrr_forecast_remaining_hours)
-```
-
-This gives the freshest possible estimate of the final daily high, often catching market mispricing that emerges when actual temperatures diverge from overnight forecasts.
-
-### Autoresearch Loop
-
-Inspired by Karpathy's autoresearch concept — automated parameter improvement without human intervention:
-
-1. **Propose** — perturb one or two parameters from the current best (see search space below)
-2. **Validate** — walk-forward Brier scoring on historical resolved trades
-3. **Compare** — measure improvement vs. current production params
-4. **Promote** — automatically apply if improvement > 5%; record in `experiments` table for audit
-
-**Search space (5 parameters + 2-param combos every 5th experiment):**
-
-| Parameter | Range | Step |
-|---|---|---|
-| `base_std_f` | 2.5 – 12.0 | 0.5 |
-| `temp_T` | 0.7 – 1.8 | 0.1 |
-| `min_executable_edge` | 0.02 – 0.15 | 0.01 |
-| `max_kelly_fraction` | 0.05 – 0.40 | 0.05 |
-| `stale_forecast_hours` | 6 – 48 | 6 |
-
-Combo proposals (every 5th run): `[base_std_f, temp_T]` and `[min_executable_edge, max_kelly_fraction]`.
-
----
-
-## CLI Reference
+**Requirements:** Python 3.11+
 
 ```bash
-# Paper trading (real market data, no real orders)
-python main.py --paper                    # single cycle
-python main.py --paper --loop             # continuous (default: every 5 min)
-python main.py --paper --loop --interval 120   # every 2 minutes
+git clone https://github.com/lucaskardo/weather-trading-bot.git
+cd weather-trading-bot
 
-# Live trading (requires Kalshi API keys in .env)
-python main.py --live                     # single cycle
-python main.py --live --loop              # continuous
+python3 -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
 
-# Research & calibration
-python main.py --calibrate                # run calibration pipeline
-python main.py --autoresearch             # propose + run one experiment
+pip install -r requirements.txt
+```
 
-# Dashboard
-python main.py --dashboard                # start API server (port 5001)
-python main.py --dashboard --port 8080    # custom port
-# Then open dashboard/index.html in browser
+`requirements.txt`:
+```
+requests>=2.31
+python-dotenv>=1.0
+numpy>=1.26
+scipy>=1.12
+flask>=3.0
+```
+
+---
+
+## Configuration (.env)
+
+Create a `.env` file in the project root. All fields are optional — the bot runs with defaults if the file is missing.
+
+```ini
+# .env
+
+# Starting bankroll (only applied on first run when DB is at default $1000)
+BANKROLL=5000
+
+# Hard daily loss limit in dollars (overrides the default 5%-of-bankroll rule)
+DAILY_LOSS_LIMIT=250
+
+# How often to poll in continuous loop mode (seconds)
+POLL_INTERVAL_S=300
+
+# NOAA CDO token — used for historical settlement data
+# Free at: https://www.ncdc.noaa.gov/cdo-web/token
+# Without this, settlement falls back to IEM ASOS data (no auth required)
+NOAA_CDO_TOKEN=your_token_here
+
+# Kalshi API credentials — only required for live trading
+KALSHI_KEY_ID=your_key_id
+KALSHI_PRIVATE_KEY_PATH=/path/to/rsa_private_key.pem
+```
+
+Verify your config is loaded correctly:
+
+```bash
+python main.py --diagnose
+```
+
+---
+
+## Paper Trading
+
+Paper trading uses real market data and real forecasts, but executes orders to your local SQLite database instead of the exchange. No money is at risk.
+
+### Quick start — single cycle
+
+```bash
+python main.py --paper
+```
+
+Fetches live markets and forecasts, runs all strategies, logs any signals to `data/bot.db`. Prints a summary:
+
+```
+──────────────────────────────────────────────────
+  CONFIG
+──────────────────────────────────────────────────
+  .env file        found
+  Bankroll         $5000.00
+  Daily loss limit $250.00
+  Poll interval    300s
+  NOAA CDO token   set
+  Kalshi API key   not set (only needed for live trading)
+
+[main] kalshi: 14 markets fetched
+[main] polymarket: 3 markets fetched
+[main] 12 forecast(s) for 6 city/date pair(s)
+{'cycle_at': '...', 'signals_generated': 4, 'signals_executable': 2, 'executed': 2, ...}
+```
+
+### Continuous paper trading loop
+
+```bash
+python main.py --paper --loop
+```
+
+Runs a cycle every `POLL_INTERVAL_S` seconds (default 300). Keep this running in a terminal or via a process manager.
+
+### Check current status
+
+```bash
+python main.py --status
+```
+
+Shows bankroll, cash available, all open positions, and total realized PnL — without running a trading cycle.
+
+### Deploying for continuous paper testing
+
+**Using `nohup` (simplest):**
+
+```bash
+nohup python main.py --paper --loop > logs/paper.log 2>&1 &
+echo $! > logs/paper.pid
+
+# Stop it:
+kill $(cat logs/paper.pid)
+```
+
+**Using `screen`:**
+```bash
+screen -S weatherbot
+python main.py --paper --loop
+# Ctrl+A D to detach
+# screen -r weatherbot to reattach
+```
+
+**Using a cron job (single cycle every 5 minutes):**
+```bash
+crontab -e
+# Add:
+*/5 * * * * cd /path/to/weather-trading-bot && venv/bin/python main.py --paper >> logs/paper.log 2>&1
+```
+
+---
+
+## Live Trading (Kalshi)
+
+> **Warning:** Live trading places real orders with real money. Run paper trading first and confirm the bot behaves as expected before going live.
+
+### Prerequisites
+
+1. A funded [Kalshi](https://kalshi.com) account
+2. API credentials (Key ID + RSA private key) from your Kalshi account settings
+3. Set credentials in `.env`:
+   ```ini
+   KALSHI_KEY_ID=your_key_id
+   KALSHI_PRIVATE_KEY_PATH=/path/to/rsa_private_key.pem
+   ```
+4. Verify connectivity:
+   ```bash
+   python main.py --diagnose
+   ```
+
+### Run a single live cycle
+
+```bash
+python main.py --live
+```
+
+### Continuous live trading
+
+```bash
+python main.py --live --loop
+```
+
+With a custom poll interval:
+
+```bash
+python main.py --live --loop --interval 600
+```
+
+### Switching from paper to live
+
+The bot uses the same `data/bot.db` for both modes. Positions logged during paper trading remain in the DB and will affect capital allocation and risk guards. For a clean slate when going live:
+
+```bash
+rm data/bot.db      # wipes all paper history
+python main.py --live
 ```
 
 ---
 
 ## Dashboard
 
-Start the bot in one terminal, the dashboard API in another, and open the HTML file in a browser — no build step required. A **QuickStats bar** across the top of every tab shows live bankroll, P&L, open positions, win rate, and last-cycle summary. A **Last Cycle panel** at the top of Tab 1 shows signals generated, executed, and exits from the most recent run.
+The dashboard is a single-file React app backed by a Flask API server. It reads directly from `data/bot.db` and shows live portfolio stats, open positions, strategy performance, forecast quality, and trade history.
+
+### Start the dashboard
+
+**Terminal 1 — API server:**
+```bash
+python main.py --dashboard
+# or:
+python dashboard/api.py
+```
+
+**Terminal 2 — open in browser:**
+Double-click `dashboard/index.html`, or serve it locally:
+```bash
+open dashboard/index.html      # macOS
+xdg-open dashboard/index.html  # Linux
+```
+
+The API listens on `http://localhost:5001` by default. Custom port:
+```bash
+python main.py --dashboard --port 5002
+```
+
+### Running bot + dashboard together
 
 ```bash
-# Terminal 1
+# Terminal 1 — trading loop
 python main.py --paper --loop
 
-# Terminal 2
+# Terminal 2 — dashboard API
 python main.py --dashboard
 
-# Browser
-open dashboard/index.html
+# Browser — open dashboard/index.html
 ```
 
-**Tab 1 — Live Trading**
-- Current bankroll and total P&L
-- Open positions with entry price, size, edge
-- Per-strategy capital allocation with bar chart
-- Cluster exposure heatmap (geographic risk)
-- Recent trades table
+The bot posts each cycle's summary to the dashboard automatically. The "Last Cycle" panel at the top of Tab 1 updates on refresh.
 
-**Tab 2 — Strategy Performance**
-- Per-strategy KPIs: Sharpe, Brier, win rate, trade count, avg hold time
-- Live vs. shadow comparison table
-- Brier score trend over time
-- MFE/MAE scatter per strategy
+### Dashboard tabs
 
-**Tab 3 — Autoresearch**
-- Full experiment registry with baseline vs. candidate Brier comparison
-- Improvement % and promotion status per experiment
-- Promotion candidates highlighted (score > 75, shadow mode)
-- **▶ Run Experiment** button — triggers one autoresearch cycle from the browser
-
-**Tab 4 — Forecast Quality**
-- Per-city, per-model bias chart (°F systematic error)
-- Model agreement heatmap (inter-model spread)
-- Settlement vs. forecast residuals scatter
+| Tab | What it shows |
+|-----|---------------|
+| **Live Trading** | Bankroll KPIs, open positions, strategy allocation, cluster exposure, recent signals with freshness badges (● LIVE / Xm ago) |
+| **Strategy Performance** | Per-strategy win rate, total PnL, avg hold time, MFE/MAE, Brier score trend |
+| **Autoresearch** | Experiment registry, promotion candidates, run-experiment button |
+| **Forecast Quality** | Per-city/model forecast bias, model agreement spread, settlement vs forecast residuals |
+| **History** | Closed positions table with full entry/exit detail, daily PnL history with cumulative totals |
 
 ---
 
-## Database Schema
-
-SQLite WAL-mode — crash-safe, no server required. 9 tables:
-
-| Table | Purpose |
-|---|---|
-| `markets` | Open and settled weather markets from all exchanges |
-| `forecasts` | Raw model forecasts with full run lineage (run_id, publish_time, source_url) |
-| `predictions` | All signals — live (`is_shadow=0`) and shadow (`is_shadow=1`) |
-| `positions` | Open and closed positions with analytics (MFE, MAE, hold_time, edge lineage) |
-| `portfolio` | Singleton bankroll and cash tracking |
-| `daily_pnl` | Per-day realized P&L for loss-limit enforcement |
-| `strategy_metrics` | Scorecard snapshots and promotion audit trail |
-| `settlement_cache` | Cached NWS official settlement data |
-| `experiments` | Autoresearch experiment registry with full results |
-
----
-
-## Configuration
-
-Copy `.env.example` to `.env`:
-
-```env
-PAPER_MODE=true
-BANKROLL=1000.0
-DAILY_LOSS_LIMIT=50.0
-POLL_INTERVAL_S=300
-NOAA_CDO_TOKEN=          # free: https://www.ncdc.noaa.gov/cdo-web/token
-KALSHI_KEY_ID=           # live trading only
-KALSHI_PRIVATE_KEY_PATH= # live trading only
-DB_PATH=data/bot.db
-```
-
-Key parameters in `shared/params.py`:
-
-| Parameter | Default | Calibrated? | Description |
-|---|---|---|---|
-| `base_std_f` | `5.0` | ✅ Weekly | Baseline forecast std dev in °F (dynamic_std_f scales this up) |
-| `temp_T` | `1.0` | ✅ Weekly | Platt temperature scaling factor |
-| `min_executable_edge` | `0.05` | ✅ Autoresearch | Min edge after full cost stack |
-| `max_kelly_fraction` | `0.25` | ✅ Autoresearch | Kelly fraction cap per position |
-| `stale_forecast_hours` | `12.0` | ✅ Autoresearch | Hours before a forecast is stale |
-| `slippage_buffer_cents` | `1.0` | — | Slippage padding in cents |
-| `min_depth_usd` | `50.0` | — | Min orderbook depth to trade |
-| `daily_loss_limit_usd` | `50.0` | — | Daily loss halt threshold |
-| `cluster_cap_usd` | `200.0` | — | Max exposure per geographic cluster |
-| `max_positions_per_city` | `3` | — | Max concurrent positions per city |
-
----
-
-## Supported Markets
-
-### Kalshi (8 US cities)
-`KXHIGHNY` · `KXHIGHCHI` · `KXHIGHLA` · `KXHIGHDC` · `KXHIGHSF` · `KXHIGHHOU` · `KXHIGHMIA` · `KXHIGHBOS`
-
-### Polymarket
-All active weather markets discovered via the `weather` tag on the Gamma API.
-
-### Weather Models
-
-| Model | Provider | Resolution | Update Frequency |
-|---|---|---|---|
-| GFS | NOAA | ~13km | 4× daily |
-| ECMWF IFS | ECMWF | ~9km | 2× daily |
-| ICON | DWD | ~13km | 4× daily |
-| AROME | Météo-France | ~1.3km | 4× daily (Europe) |
-| NOAA/NWS | NOAA | ~3km | Hourly (HRRR) |
-
-### Geographic Clusters
-
-| Cluster | Cities | Purpose |
-|---|---|---|
-| Northeast | NYC, BOS, DC | Correlated East Coast weather |
-| Midwest | CHI, DAL | Central US systems |
-| South | MIA, HOU, ATL | Gulf + subtropical |
-| West | LA, SF, SEA | Pacific Coast |
-| Europe | LON, PAR, MUN | Atlantic weather systems |
-| Asia | SEO | East Asia |
-| South America | BUE, SAO | Southern Hemisphere |
-
-Cluster definitions drive the `ClusterCapExceeded` risk guard — correlated weather exposure is capped at the cluster level, not just per city.
-
----
-
-## Potential Integrations & Collaborations
-
-### Data Sources
-
-| Tool / API | Integration Opportunity |
-|---|---|
-| **Weatherbit API** | Alternative high-resolution US forecasts; useful as a 6th model vote to reduce model risk |
-| **Tomorrow.io** | Proprietary ML-based forecasts; their API provides probability distributions directly, which could replace parts of the Gaussian approximation |
-| **IBM Environmental Intelligence** | Enterprise weather APIs with ensemble spread data — useful for `DisagreementStrategy` |
-| **Copernicus ERA5** | Historical reanalysis dataset for deeper bias correction training (decades of actuals vs. model hindcasts) |
-| **NCEP GEFS** | 30-member ensemble from NOAA — provides probabilistic forecasts natively rather than point estimates |
-| **Meteomatics** | Sub-hourly gridded forecasts useful for intraday HRRR replacement/supplement |
-
-### Prediction Market Platforms
-
-| Platform | Integration Opportunity |
-|---|---|
-| **Manifold Markets** | Open platform with API — good for shadow-testing strategies against play-money markets before deploying to Kalshi |
-| **Augur v2** | Decentralized prediction market; cross-venue arbitrage if same weather contract exists |
-| **Polymarket CLOB** | Live order placement (signals already work; execution client is next milestone) |
-| **Metaculus** | Research-grade forecasting community; their aggregated community forecasts on temperature markets could be used as a consensus signal |
-
-### Research & Analytics
-
-| Tool | Integration Opportunity |
-|---|---|
-| **Weights & Biases (wandb)** | Experiment tracking for the autoresearch loop — log Brier scores, parameter variants, and walk-forward fold results as W&B runs instead of SQLite only |
-| **MLflow** | Open-source alternative to wandb; model registry for tracking calibrated parameter versions |
-| **Grafana + SQLite plugin** | Production-grade dashboarding on top of the existing `bot.db` — replaces the hand-rolled React dashboard for teams |
-| **Prometheus + Alertmanager** | Expose `/metrics` endpoint from the Flask API; alert on daily loss limit approach, stale forecast warnings |
-| **Prefect / Airflow** | Replace the manual `--loop` scheduler with a proper DAG — separate fetching, signal generation, execution, and calibration into distinct tasks with retries |
-
-### Notification & Monitoring
-
-| Tool | Integration Opportunity |
-|---|---|
-| **Slack / Discord webhooks** | Post trade summaries, promotion candidates, and risk guard firings to a channel |
-| **Telegram Bot API** | Mobile alerts for large edge signals or daily P&L summaries |
-| **PagerDuty** | On-call alerting for `StaleDataHalt` or reconciliation failures in live mode |
-| **Sentry** | Error tracking for production deployments — catches API timeouts, DB corruption, unexpected exceptions |
-
-### Execution & Infrastructure
-
-| Tool | Integration Opportunity |
-|---|---|
-| **Kalshi FIX API** | Lower-latency order placement than REST for time-sensitive intraday signals |
-| **Redis** | Replace SQLite settlement cache with Redis for multi-process deployments; pub/sub for real-time signal distribution |
-| **Docker + docker-compose** | Containerize bot + dashboard; `docker-compose up` for one-command deployment |
-| **Fly.io / Railway** | Zero-config cloud deployment — runs the bot loop as a persistent process without managing a server |
-| **GitHub Actions** | Nightly calibration runs as a CI job; PR checks that run the full test suite |
-
-### Academic / Research Collaboration
-
-| Resource | Opportunity |
-|---|---|
-| **ClimateCorp / Jupiter Intelligence** | Climate-adjusted temperature baselines that account for long-term warming trends in city-level high temperature distributions |
-| **WeatherBench2** | Open benchmark for NWP model evaluation — compare our ensemble against state-of-the-art baselines to validate the multi-model approach |
-| **ProbabilisticForecastEvaluation (R package)** | Formal verification tools for our Brier decomposition and reliability diagrams |
-
----
-
-## Live Trading Setup
-
-### Kalshi
-1. Create account at [kalshi.com](https://kalshi.com)
-2. Go to **Settings → API Keys** → generate RSA key pair
-3. Download the private key `.pem` file
-4. Set in `.env`:
-   ```
-   KALSHI_KEY_ID=your-key-id
-   KALSHI_PRIVATE_KEY_PATH=/path/to/key.pem
-   PAPER_MODE=false
-   ```
-5. Run: `python main.py --live`
-
-### Polymarket
-Signal generation and market discovery are fully implemented. Live order placement (CLOB signing) is the next milestone — contributions welcome.
-
----
-
-## Safety
-
-| Guard | Trigger | Effect |
-|---|---|---|
-| `StaleDataHalt` | All forecasts > `max_forecast_age_hours` old | Block all new entries |
-| `ClusterCapExceeded` | Cluster exposure + proposed > `cluster_cap_usd` | Block that trade |
-| `DailyLossHalt` | Realized + unrealized MTM loss ≥ limit | Block all new entries |
-| `CityLimitExceeded` | Open positions in city ≥ `max_positions_per_city` | Block that trade |
-| Reconciliation | Any startup — local DB vs. exchange diff | Flag critical discrepancies before first trade |
-
-All trades are **paper by default**. Live trading requires explicit `--live` flag every invocation — there is no persistent "live mode" setting that could accidentally persist.
-
----
-
-## Development
+## Commands Reference
 
 ```bash
-# Install dev dependencies
-pip install -r requirements.txt pytest
+# Test all API connections and DB health
+python main.py --diagnose
 
-# Run all tests
-python -m pytest tests/ -v
+# Show portfolio + open positions (no trading)
+python main.py --status
 
-# Run specific module tests
-python -m pytest tests/test_kalshi_client.py -v
-python -m pytest tests/test_phase_b.py -v
+# Single paper cycle
+python main.py --paper
 
-# Run calibration
+# Continuous paper loop (5-minute default interval)
+python main.py --paper --loop
+
+# Continuous paper loop with custom interval
+python main.py --paper --loop --interval 120
+
+# Single live cycle
+python main.py --live
+
+# Continuous live loop
+python main.py --live --loop
+
+# Run calibration (optimises temperature scaling T)
 python main.py --calibrate
 
-# Run one autoresearch cycle
+# Run one autoresearch experiment
 python main.py --autoresearch
-```
 
-Tests: **440 passing**, 2 skipped (scipy differential evolution — install scipy to enable).
+# Start dashboard API server
+python main.py --dashboard
+
+# Dashboard on a custom port
+python main.py --dashboard --port 5002
+```
 
 ---
 
-## Roadmap
+## Strategies
 
-### Recently Completed (V5 Audit)
-- [x] Markets persisted to DB before signal generation (market_id always populated)
-- [x] Full entry snapshots stored in `positions.entry_reason` JSON
-- [x] Bias correction integrated into ValueEntry signal pipeline
-- [x] Dynamic forecast uncertainty (`dynamic_std_f`) — lead time + model spread + season
-- [x] `ExchangeExecutor` abstraction (`PaperExecutor` / `KalshiExecutor`)
-- [x] Autoresearch search space expanded to 5 params + 2-param combo proposals
-- [x] Dashboard: QuickStats bar, Last Cycle panel, Run Experiment button, 3 new endpoints
+Four strategies run every cycle. Each generates signals independently; the router allocates capital based on recent performance.
 
-### Next Milestones
-- [ ] Polymarket live execution (CLOB order signing)
-- [ ] EMOS post-processing on raw forecasts (proper ensemble calibration)
-- [ ] Maker-first execution (Kalshi maker rebate exploitation)
-- [ ] Cross-venue arbitrage scanner (Kalshi ↔ Polymarket same-contract price differences)
-- [ ] Ensemble dispersion signal (trade adjacent bins when model spread high, market narrow)
-- [ ] Grafana dashboard integration
-- [ ] Docker + Fly.io deployment
-- [ ] Slack/Discord trade notifications
-- [ ] Walk-forward optimization on strategy router weights (not just `base_std_f`)
+### ValueEntry
+Enters when the model's fair value diverges from the market price by more than `min_executable_edge` (default 5¢ after fees). Uses a Monte Carlo probability engine over multi-model consensus forecasts with dynamic uncertainty scaling and Platt temperature calibration.
+
+Also handles **ConvergenceExit**: exits a position mid-trade if fair value has converged toward the market price (edge gone) or the position has moved against the model.
+
+### ModelRelease
+Trades the information event when a new forecast model run is released (e.g. the 00Z GFS cycle). Prices can move when a major model shifts; this strategy enters quickly and exits once the market has repriced.
+
+### Disagreement
+Trades when two or more models disagree significantly (high spread in °F). Takes a position in the direction of the consensus, betting the outlier model is wrong.
+
+### Capital routing
+
+Each strategy is scored on a 0–100 scale:
+
+| Component | Weight |
+|-----------|--------|
+| Sharpe ratio | 35% |
+| Brier score (calibration) | 30% |
+| Execution quality | 20% |
+| Max drawdown | 10% |
+| Score instability | 5% |
+
+Capital is allocated via softmax over scores, then Kelly criterion sizes each individual bet (capped at 25% of allocated budget per trade).
+
+---
+
+## Risk Management
+
+### Hard limits
+
+| Guard | Default | Override |
+|-------|---------|----------|
+| Daily loss limit | 5% of bankroll | `DAILY_LOSS_LIMIT=250` in `.env` |
+| Cluster exposure cap | 15% of bankroll per geographic cluster | `params.max_cluster_exposure_pct` |
+| Max positions per city | 3 | `params.max_positions_per_city` |
+| Stale data halt | Halts if best forecast > 6h old | `params.stale_forecast_hours` |
+| Max Kelly fraction | 25% per trade | `params.max_kelly_fraction` |
+| Min executable edge | 5¢ after fees/slippage | `params.min_executable_edge` |
+
+**Geographic clusters** (each capped independently): Northeast (NYC/BOS/DC), Midwest (CHI/DAL), South (MIA/HOU/ATL), West (LA/SF/SEA), Europe (LON/PAR/MUN), Asia (SEO), South America (BUE/SAO).
+
+### Position exits
+
+| Exit type | Trigger |
+|-----------|---------|
+| **Settlement** | NWS/IEM actual temperature fetched after market close → WON or LOST |
+| **Convergence** | Fair value converges to market price (edge below threshold) |
+| **Stop-loss** | Position moves against model by configurable amount |
+| **Pre-settlement** | Liquidity dries up in final hours; exit early |
+
+---
+
+## Autoresearch & Calibration
+
+### Calibration
+
+Calibration optimises the Platt temperature scaling parameter `T` using walk-forward cross-validation on resolved trades:
+
+```bash
+python main.py --calibrate
+```
+
+The calibrator reads all resolved predictions from `data/bot.db`, runs 5-fold walk-forward Brier score evaluation, and updates `PARAMS.temp_scaling_T` in-process.
+
+### Autoresearch
+
+Autoresearch proposes and tests parameter mutations (edge thresholds, std scaling, Kelly fractions, etc.) using the same walk-forward backtester. Experiments that improve Brier score are automatically promoted to live parameters.
+
+```bash
+# Run one experiment cycle from CLI
+python main.py --autoresearch
+
+# Or trigger from the dashboard (Autoresearch tab → ▶ Run Experiment)
+```
+
+Requires at least 6 resolved trades in the database. All experiments are logged to the `experiments` table and visible in the dashboard.
+
+---
+
+## Project Structure
+
+```
+weather-trading-bot/
+├── main.py                     # Entry point + all CLI flags
+├── requirements.txt
+├── .env                        # Your config (not committed)
+├── data/
+│   └── bot.db                  # SQLite database (auto-created on first run)
+├── logs/                       # Log files
+├── clients/
+│   ├── kalshi_client.py        # Kalshi REST API client
+│   ├── polymarket_client.py    # Polymarket API client
+│   ├── weather.py              # Open-Meteo multi-model weather fetcher
+│   └── nws_settlement.py       # NWS/IEM settlement fetcher (no auth required)
+├── core/
+│   └── forecaster.py           # Canonical fair value pipeline
+├── strategies/
+│   ├── base.py                 # Signal dataclass, BaseStrategy
+│   ├── value_entry.py          # ValueEntry + convergence exit
+│   ├── convergence_exit.py
+│   ├── model_release.py
+│   └── disagreement.py
+├── strategy_router/
+│   ├── brain.py                # Cycle orchestrator
+│   ├── scorecard.py            # Strategy scoring
+│   ├── allocator.py            # Capital allocation
+│   └── selector.py             # Signal filtering + Kelly sizing
+├── execution/
+│   ├── exchange_executor.py    # PaperExecutor / KalshiExecutor
+│   ├── lifecycle.py            # Position exit engine
+│   └── orderbook.py            # Fee/slippage math
+├── risk/
+│   ├── guards.py               # Hard risk guards
+│   └── reconciliation.py       # Position reconciliation
+├── research/
+│   ├── calibrator.py           # Temperature scaling calibration
+│   ├── autoresearch.py         # Automated experiment engine
+│   ├── walk_forward.py         # Walk-forward backtester
+│   └── bias_correction.py      # Forecast bias database
+├── state/
+│   └── db.py                   # SQLite schema + init
+├── shared/
+│   ├── params.py               # All tunable parameters (Params dataclass)
+│   └── types.py                # Shared type definitions
+├── dashboard/
+│   ├── api.py                  # Flask REST API server
+│   └── index.html              # Single-file React dashboard
+└── tests/                      # 459 unit + integration tests
+```
+
+---
+
+## Running Tests
+
+```bash
+python3 -m pytest tests/ -q
+```
+
+Expected output:
+```
+459 passed, 2 skipped in 0.50s
+```
+
+Run a specific test file:
+```bash
+python3 -m pytest tests/test_v8_bugs.py -v
+python3 -m pytest tests/test_strategies.py -v
+python3 -m pytest tests/test_risk_guards.py -v
+```
+
+---
+
+## Troubleshooting
+
+**`0 markets fetched` from Kalshi**
+Kalshi's weather series ticker names change seasonally. Run `--diagnose` to see what's live. The client searches by keyword and should auto-discover active series.
+
+**`Not enough resolved trades to run experiments`**
+Autoresearch requires at least 6 settled positions. Run paper trading for a few days until contracts expire and settle.
+
+**`StaleDataHalt`**
+The Open-Meteo API may be temporarily unavailable. The bot retries on the next cycle. Check with `--diagnose`.
+
+**Dashboard shows no data**
+Make sure `python main.py --dashboard` is running before opening `index.html`. The API must be on `localhost:5001`.
+
+**`Cannot start live mode: missing KALSHI_KEY_ID`**
+Add your Kalshi API credentials to `.env`. See [Live Trading](#live-trading-kalshi).
