@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -85,6 +86,7 @@ def fetch_all_weather_markets(
                     markets.append(parsed)
         except Exception as exc:
             print(f"[kalshi] error fetching {series_ticker}: {exc}", file=sys.stderr)
+        time.sleep(0.5)
 
     return markets
 
