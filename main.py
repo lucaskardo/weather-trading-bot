@@ -121,16 +121,25 @@ def _persist_markets(markets: list, conn) -> None:
 def _fetch_forecasts(markets: list, conn) -> list:
     """Fetch weather forecasts for all unique (city, target_date) pairs."""
     from clients.weather import fetch_and_store
+    from datetime import date as _date
 
+    today = _date.today().isoformat()
     forecasts = []
     seen: set = set()
     for m in markets:
-        key = (m.get("city"), m.get("target_date"))
-        if None in key or key in seen:
+        target_date = m.get("target_date")
+        city = m.get("city")
+        if not target_date or not city:
+            continue
+        # Skip past dates — Open-Meteo only serves forecasts for today + future
+        if target_date < today:
+            continue
+        key = (city, target_date)
+        if key in seen:
             continue
         seen.add(key)
         try:
-            city_forecasts = fetch_and_store(m["city"], m["target_date"], conn)
+            city_forecasts = fetch_and_store(city, target_date, conn)
             forecasts.extend(city_forecasts)
         except Exception as exc:
             print(f"[main] forecast error for {key}: {exc}", file=sys.stderr)

@@ -2,11 +2,14 @@
 Tests for clients/kalshi_client.py
 
 All HTTP calls are mocked — no real API calls.
+
+The Kalshi client now uses a single endpoint per series:
+  GET /markets?series_ticker=KXHIGHNY&status=open
+No events, no nested-markets flow.
 """
 
 from __future__ import annotations
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -88,20 +91,13 @@ class TestParseTicker:
 # fetch_all_weather_markets
 # ---------------------------------------------------------------------------
 
-def _make_event_response(event_ticker="KXHIGHNY-26MAR13", include_markets=False):
-    event = {"event_ticker": event_ticker}
-    if include_markets:
-        event["markets"] = [_make_markets_response(f"{event_ticker}-T68")["markets"][0]]
-    return {"events": [event]}
-
-
 def _make_markets_response(ticker="KXHIGHNY-26MAR13-T68", status="open"):
     return {
         "markets": [{
             "ticker": ticker,
             "status": status,
             "subtitle": "above 68 degrees",
-            # Legacy integer-cent fields (still supported)
+            # Legacy integer-cent fields (still supported as fallback)
             "yes_bid": 55,
             "yes_ask": 57,
             # New fixed-point dollar fields (preferred as of March 2026)
@@ -109,46 +105,29 @@ def _make_markets_response(ticker="KXHIGHNY-26MAR13-T68", status="open"):
             "yes_ask_dollars": "0.57",
             "volume": 1000,
             "open_interest": 500,
-        }]
+        }],
+        "cursor": None,
     }
 
 
 class TestFetchAllWeatherMarkets:
-    def _mock_session(self, event_resp, markets_resp):
-        """
-        Route by URL/params:
-          /events (GET /events?series_ticker=...) → events_r
-          /markets (GET /markets?event_ticker=...)  → markets_r
-        The URL heuristic still works: events URL contains '/events',
-        markets fallback URL contains '/markets' (not '/events').
-        """
+    def _mock_session(self, markets_resp):
+        """Mock session that returns markets_resp for any GET /markets call."""
         session = MagicMock()
-        events_r = MagicMock()
-        events_r.json.return_value = event_resp
-        markets_r = MagicMock()
-        markets_r.json.return_value = markets_resp
-
-        def get_side_effect(url, **kwargs):
-            if "/events" in url and "/markets" not in url:
-                return events_r
-            return markets_r
-
-        session.get.side_effect = get_side_effect
+        resp_mock = MagicMock()
+        resp_mock.json.return_value = markets_resp
+        session.get.return_value = resp_mock
         return session
 
     def test_returns_list(self):
-        session = self._mock_session(
-            {"events": []}, {"markets": []}
-        )
+        session = self._mock_session({"markets": [], "cursor": None})
         result = fetch_all_weather_markets(session=session)
         assert isinstance(result, list)
 
     def test_parses_above_market(self):
         session = self._mock_session(
-            _make_event_response("KXHIGHNY-26MAR13"),
             _make_markets_response("KXHIGHNY-26MAR13-T68"),
         )
-        # Only mock for NYC series
         with patch("clients.kalshi_client.WEATHER_SERIES", ["KXHIGHNY"]):
             result = fetch_all_weather_markets(session=session)
 
@@ -160,18 +139,55 @@ class TestFetchAllWeatherMarkets:
         assert m["high_f"] == 68.0
         assert m["exchange"] == "kalshi"
 
-    def test_market_price_from_yes_ask(self):
+    def test_market_price_from_yes_ask_dollars(self):
+        """yes_ask_dollars field used as market price."""
         session = self._mock_session(
-            _make_event_response("KXHIGHNY-26MAR13"),
             _make_markets_response("KXHIGHNY-26MAR13-T68"),
         )
         with patch("clients.kalshi_client.WEATHER_SERIES", ["KXHIGHNY"]):
             result = fetch_all_weather_markets(session=session)
         assert abs(result[0]["market_price"] - 0.57) < 1e-9
 
+    def test_dollars_fields_take_precedence_over_cents(self):
+        """yes_ask_dollars wins over yes_ask (cents) when both present."""
+        session = self._mock_session({
+            "markets": [{
+                "ticker": "KXHIGHNY-26MAR13-T68",
+                "status": "open",
+                "subtitle": "above 68 degrees",
+                "yes_bid": 40,            # legacy cents (0.40) — ignored
+                "yes_ask": 42,            # legacy cents (0.42) — ignored
+                "yes_bid_dollars": "0.62",
+                "yes_ask_dollars": "0.64",
+                "volume": 100,
+                "open_interest": 50,
+            }],
+            "cursor": None,
+        })
+        with patch("clients.kalshi_client.WEATHER_SERIES", ["KXHIGHNY"]):
+            result = fetch_all_weather_markets(session=session)
+        assert abs(result[0]["market_price"] - 0.64) < 1e-9
+
+    def test_legacy_cents_used_when_no_dollars_fields(self):
+        """Falls back to integer cents when _dollars fields are absent."""
+        session = self._mock_session({
+            "markets": [{
+                "ticker": "KXHIGHNY-26MAR13-T68",
+                "status": "open",
+                "subtitle": "above 68 degrees",
+                "yes_bid": 58,
+                "yes_ask": 60,
+                "volume": 100,
+                "open_interest": 50,
+            }],
+            "cursor": None,
+        })
+        with patch("clients.kalshi_client.WEATHER_SERIES", ["KXHIGHNY"]):
+            result = fetch_all_weather_markets(session=session)
+        assert abs(result[0]["market_price"] - 0.60) < 1e-9
+
     def test_skips_non_open_markets(self):
         session = self._mock_session(
-            _make_event_response("KXHIGHNY-26MAR13"),
             _make_markets_response("KXHIGHNY-26MAR13-T68", status="settled"),
         )
         with patch("clients.kalshi_client.WEATHER_SERIES", ["KXHIGHNY"]):
@@ -179,12 +195,12 @@ class TestFetchAllWeatherMarkets:
         assert len(result) == 0
 
     def test_skips_unparseable_ticker(self):
-        session = self._mock_session(
-            _make_event_response("KXHIGHNY-26MAR13"),
-            {"markets": [{"ticker": "INVALID", "status": "open",
-                           "yes_bid": 50, "yes_ask": 52,
-                           "volume": 0, "open_interest": 0}]},
-        )
+        session = self._mock_session({
+            "markets": [{"ticker": "INVALID", "status": "open",
+                         "yes_bid": 50, "yes_ask": 52,
+                         "volume": 0, "open_interest": 0}],
+            "cursor": None,
+        })
         with patch("clients.kalshi_client.WEATHER_SERIES", ["KXHIGHNY"]):
             result = fetch_all_weather_markets(session=session)
         assert len(result) == 0
@@ -197,7 +213,6 @@ class TestFetchAllWeatherMarkets:
 
     def test_required_fields_present(self):
         session = self._mock_session(
-            _make_event_response("KXHIGHNY-26MAR13"),
             _make_markets_response("KXHIGHNY-26MAR13-T68"),
         )
         with patch("clients.kalshi_client.WEATHER_SERIES", ["KXHIGHNY"]):
@@ -207,51 +222,30 @@ class TestFetchAllWeatherMarkets:
                     "high_f", "market_price", "exchange", "volume", "open_interest"}
         assert required.issubset(result[0].keys())
 
-    def test_dollars_fields_take_precedence_over_cents(self):
-        """_dollars fields are preferred; cents fields ignored when both present."""
-        session = self._mock_session(
-            _make_event_response("KXHIGHNY-26MAR13"),
-            {"markets": [{
-                "ticker": "KXHIGHNY-26MAR13-T68",
-                "status": "open",
-                "subtitle": "above 68 degrees",
-                "yes_bid": 40,           # legacy cents (0.40) — should be ignored
-                "yes_ask": 42,           # legacy cents (0.42) — should be ignored
-                "yes_bid_dollars": "0.62",   # new dollars — should win
-                "yes_ask_dollars": "0.64",   # new dollars — should win
-                "volume": 100,
-                "open_interest": 50,
-            }]},
-        )
-        with patch("clients.kalshi_client.WEATHER_SERIES", ["KXHIGHNY"]):
-            result = fetch_all_weather_markets(session=session)
-        # ask_dollars=0.64 should be used as market_price
-        assert abs(result[0]["market_price"] - 0.64) < 1e-9
-
-    def test_nested_markets_used_when_present(self):
-        """When event has nested markets, no separate /markets call is made."""
+    def test_pagination_follows_cursor(self):
+        """Fetches next page when cursor is returned."""
         session = MagicMock()
-        events_r = MagicMock()
-        events_r.json.return_value = _make_event_response(
-            "KXHIGHNY-26MAR13", include_markets=True
-        )
-
-        call_log = []
-        def get_side_effect(url, **kwargs):
-            call_log.append(url)
-            if "/events" in url and "/markets" not in url:
-                return events_r
-            raise AssertionError(f"Should not call fallback: {url}")
-
-        session.get.side_effect = get_side_effect
+        page1 = MagicMock()
+        page1.json.return_value = {
+            "markets": [{"ticker": "KXHIGHNY-26MAR13-T68", "status": "open",
+                         "subtitle": "above 68 degrees", "yes_ask_dollars": "0.55",
+                         "yes_bid_dollars": "0.53", "volume": 10, "open_interest": 5}],
+            "cursor": "next_page_token",
+        }
+        page2 = MagicMock()
+        page2.json.return_value = {
+            "markets": [{"ticker": "KXHIGHNY-26MAR14-T70", "status": "open",
+                         "subtitle": "above 70 degrees", "yes_ask_dollars": "0.45",
+                         "yes_bid_dollars": "0.43", "volume": 8, "open_interest": 4}],
+            "cursor": None,
+        }
+        session.get.side_effect = [page1, page2]
 
         with patch("clients.kalshi_client.WEATHER_SERIES", ["KXHIGHNY"]):
             result = fetch_all_weather_markets(session=session)
 
-        assert len(result) == 1
-        assert result[0]["city"] == "NYC"
-        # Only one HTTP call (events), no fallback markets call
-        assert all("/events" in u for u in call_log)
+        assert len(result) == 2
+        assert session.get.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +297,7 @@ class TestFetchOrderbook:
         session = MagicMock()
         resp = MagicMock()
         resp.json.return_value = {
-            "orderbook": {"yes": [[40, 100], [42, 200]]},   # legacy cents — ignored
+            "orderbook": {"yes": [[40, 100], [42, 200]]},   # legacy — ignored
             "orderbook_fp": {"yes_dollars": [["0.62", "100"], ["0.64", "200"]]},
         }
         session.get.return_value = resp

@@ -61,6 +61,9 @@ def fetch_all_weather_markets(
     """
     Fetch all open Kalshi weather markets and return normalised market dicts.
 
+    Uses the official Kalshi v2 /markets endpoint with series_ticker filter:
+      GET /markets?series_ticker=KXHIGHNY&status=open
+
     Each dict contains:
         id, ticker, city, target_date, market_type (above/below/band),
         high_f, low_f, market_price (0-1), exchange, volume, open_interest
@@ -73,10 +76,13 @@ def fetch_all_weather_markets(
         if not city:
             continue
         try:
-            events = _fetch_events(s, series_ticker, timeout)
-            for event in events:
-                event_markets = _fetch_markets_for_event(s, event, city, timeout)
-                markets.extend(event_markets)
+            raw_markets = _fetch_markets_for_series(s, series_ticker, timeout)
+            for m in raw_markets:
+                if m.get("status") != "open":
+                    continue
+                parsed = _parse_market(m, city)
+                if parsed:
+                    markets.append(parsed)
         except Exception as exc:
             print(f"[kalshi] error fetching {series_ticker}: {exc}", file=sys.stderr)
 
@@ -125,51 +131,45 @@ def fetch_orderbook(
 # Helpers
 # --------------------------------------------------------------------------- #
 
-def _fetch_events(
+def _fetch_markets_for_series(
     session: requests.Session,
     series_ticker: str,
     timeout: int,
 ) -> list[dict]:
-    """Fetch open events for a series using the Kalshi v2 events endpoint."""
-    url = f"{KALSHI_BASE}/events"
-    params = {"series_ticker": series_ticker, "status": "open", "limit": 100,
-              "with_nested_markets": "true"}
-    resp = session.get(url, params=params, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json().get("events", [])
+    """
+    Fetch all open markets for a series directly from /markets.
 
+    Per Kalshi official docs (March 2026):
+      GET /trade-api/v2/markets?series_ticker=KXHIGHNY&status=open
 
-def _fetch_markets_for_event(
-    session: requests.Session,
-    event: dict,
-    city: str,
-    timeout: int,
-) -> list[dict[str, Any]]:
-    event_ticker = event.get("event_ticker", "")
+    Handles cursor-based pagination for series with many markets.
+    """
+    url = f"{KALSHI_BASE}/markets"
+    all_markets: list[dict] = []
+    cursor: str | None = None
 
-    # If markets were nested in the event response (with_nested_markets=true), use them
-    raw_markets = event.get("markets") or []
+    while True:
+        params: dict[str, Any] = {
+            "series_ticker": series_ticker,
+            "status": "open",
+            "limit": 200,
+        }
+        if cursor:
+            params["cursor"] = cursor
 
-    if not raw_markets:
-        # Fallback: fetch markets separately using query params (correct v2 API)
-        url = f"{KALSHI_BASE}/markets"
-        try:
-            resp = session.get(url, params={"event_ticker": event_ticker, "limit": 100},
-                               timeout=timeout)
-            resp.raise_for_status()
-            raw_markets = resp.json().get("markets", [])
-        except Exception as exc:
-            print(f"[kalshi] markets error for {event_ticker}: {exc}", file=sys.stderr)
-            return []
+        resp = session.get(url, params=params, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
 
-    results = []
-    for m in raw_markets:
-        if m.get("status") != "open":
-            continue
-        parsed = _parse_market(m, city)
-        if parsed:
-            results.append(parsed)
-    return results
+        batch = data.get("markets", [])
+        all_markets.extend(batch)
+
+        # Cursor pagination — empty cursor means no more pages
+        cursor = data.get("cursor")
+        if not cursor or not batch:
+            break
+
+    return all_markets
 
 
 def _parse_market(m: dict, city: str) -> Optional[dict[str, Any]]:
