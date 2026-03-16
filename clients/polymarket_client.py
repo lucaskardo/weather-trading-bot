@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import sys
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import requests
@@ -92,7 +93,12 @@ def _fetch_weather_events(
 
     for tag in WEATHER_TAGS:
         try:
-            params = {"tag_slug": tag, "active": "true", "limit": 100}
+            params = {
+                "tag_slug": tag,
+                "active": "true",
+                "limit": 100,
+                "end_date_min": datetime.now(timezone.utc).isoformat(),
+            }
             resp = session.get(url, params=params, timeout=timeout)
             resp.raise_for_status()
             data = resp.json()
@@ -122,7 +128,16 @@ def _parse_market(market: dict, event: dict) -> Optional[dict[str, Any]]:
     if not city:
         return None
 
-    target_date = _extract_date(full_text)
+    # Primary: use endDate field from API; fall back to regex parsing of title text
+    target_date = None
+    end_date_str = market.get("endDate") or event.get("endDate") or ""
+    if end_date_str:
+        try:
+            target_date = end_date_str[:10]  # "2026-03-17T05:00:00Z" -> "2026-03-17"
+        except Exception:
+            target_date = None
+    if not target_date:
+        target_date = _extract_date(full_text)
     if not target_date:
         return None
 
