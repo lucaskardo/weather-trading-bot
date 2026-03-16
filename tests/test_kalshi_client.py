@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import clients.kalshi_client as kc
 from clients.kalshi_client import (
     SERIES_CITY,
     WEATHER_SERIES,
@@ -317,3 +318,26 @@ class TestFetchOrderbook:
         levels = fetch_orderbook("TICKER", session=session)
         assert levels[0]["price"] == pytest.approx(0.55)
         assert levels[1]["price"] == pytest.approx(0.57)
+
+
+def test_scan_weather_series_filters_weather_titles(monkeypatch):
+    class DummyResp:
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {
+                "markets": [
+                    {"ticker": "KXHIGHNY-26MAR13-T68", "status": "open", "title": "NY temp above 68", "yes_ask_dollars": "0.44"},
+                    {"ticker": "OTHER-1", "status": "open", "title": "stocks market", "yes_ask_dollars": "0.55"},
+                ],
+                "cursor": None,
+            }
+
+    class DummySession:
+        def get(self, url, params=None, timeout=None):
+            return DummyResp()
+
+    rows = kc.scan_weather_series(session=DummySession(), extra_series=["KXRAINNYC"])
+    assert rows
+    assert rows[0]["ticker"] == "KXHIGHNY-26MAR13-T68"
+    assert rows[0]["discovery_series"] in {"KXHIGHNY", "KXRAINNYC"}

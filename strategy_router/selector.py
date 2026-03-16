@@ -16,6 +16,7 @@ from typing import Any
 
 from shared.params import Params, PARAMS, get_cluster
 from strategies.base import Signal
+from risk.guards import estimate_portfolio_var95
 
 
 def select_signals(
@@ -49,6 +50,8 @@ def select_signals(
     cycle_cluster_add: dict[str, float] = {}
     # Track remaining per-strategy budget so we don't overspend in one cycle
     remaining_budget = dict(allocations)
+    # Track accepted pseudo-positions this cycle for VaR gating
+    cycle_positions: list[dict[str, Any]] = []
 
     for sig in ranked:
         order: dict[str, Any] = {"signal": sig}
@@ -77,7 +80,16 @@ def select_signals(
             orders.append(order)
             continue
 
-        # --- Gate 4: Remaining allocated capital ---
+        # --- Gate 4: City gross exposure cap ---
+        current_city_exposure = sum(float(p.get("size_usd", 0.0) or 0.0) for p in open_positions if p.get("city") == sig.city)
+        current_city_exposure += sum(float(p.get("size_usd", 0.0) or 0.0) for p in cycle_positions if p.get("city") == sig.city)
+        if (current_city_exposure / max(bankroll, 1.0)) >= params.max_city_exposure_pct:
+            order["size_usd"] = 0.0
+            order["reason_skipped"] = "city_exposure_cap"
+            orders.append(order)
+            continue
+
+        # --- Gate 5: Remaining allocated capital ---
         strategy_budget = remaining_budget.get(sig.strategy_name, 0.0)
         if strategy_budget <= 0:
             order["size_usd"] = 0.0
@@ -94,14 +106,32 @@ def select_signals(
             orders.append(order)
             continue
 
+        # --- Gate 6: Portfolio VaR95 proxy ---
+        proposed_position = {
+            "city": sig.city,
+            "size_usd": size_usd,
+            "side": sig.side,
+            "market_type": sig.market_type,
+        }
+        combined_positions = list(open_positions) + cycle_positions
+        var95_usd = estimate_portfolio_var95(combined_positions, bankroll, proposed_position, params)
+        if (var95_usd / max(bankroll, 1.0)) > params.max_portfolio_var95_pct:
+            order["size_usd"] = 0.0
+            order["reason_skipped"] = "var95_cap"
+            order["portfolio_var95_usd"] = var95_usd
+            orders.append(order)
+            continue
+
         order["size_usd"] = size_usd
         order["reason_skipped"] = None
+        order["portfolio_var95_usd"] = var95_usd
 
         # Update tracking
         remaining_budget[sig.strategy_name] -= size_usd
         city_counts[sig.city] = city_counts.get(sig.city, 0) + 1
         if cluster:
             cycle_cluster_add[cluster] = cycle_cluster_add.get(cluster, 0.0) + size_usd
+        cycle_positions.append(proposed_position)
 
         orders.append(order)
 

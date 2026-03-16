@@ -22,6 +22,7 @@ from risk.guards import (
     check_city_limit,
     check_cluster_exposure,
     check_daily_loss_limit,
+    estimate_portfolio_var95,
     get_daily_loss,
     is_forecast_fresh,
     check_stale_forecast,
@@ -30,6 +31,7 @@ from risk.reconciliation import (
     Discrepancy,
     DiscrepancyType,
     ReconciliationResult,
+    build_exchange_positions_from_markets,
     check_orphaned_orders,
     reconcile_positions,
 )
@@ -474,3 +476,64 @@ class TestStartupChecks:
             assert "signals_generated" in result
         finally:
             db_module.DB_PATH = original_path
+
+
+class TestPortfolioVarLimitProxy:
+    def test_same_city_positions_raise_var(self):
+        positions = [
+            {"city": "NYC", "size_usd": 150.0, "side": "YES", "market_type": "above"},
+            {"city": "NYC", "size_usd": 150.0, "side": "YES", "market_type": "above"},
+        ]
+        var95 = estimate_portfolio_var95(positions, bankroll=1000.0, params=_params())
+        assert var95 > 50.0
+
+    def test_offsetting_below_reduces_var(self):
+        same_dir = [
+            {"city": "NYC", "size_usd": 120.0, "side": "YES", "market_type": "above"},
+            {"city": "NYC", "size_usd": 120.0, "side": "YES", "market_type": "above"},
+        ]
+        hedged = [
+            {"city": "NYC", "size_usd": 120.0, "side": "YES", "market_type": "above"},
+            {"city": "NYC", "size_usd": 120.0, "side": "YES", "market_type": "below"},
+        ]
+        assert estimate_portfolio_var95(hedged, 1000.0, params=_params()) < estimate_portfolio_var95(same_dir, 1000.0, params=_params())
+
+
+
+class TestReconciliationMarketSnapshot:
+    def test_build_exchange_positions_from_markets_maps_open_positions(self, tmp_path):
+        conn = _db(tmp_path)
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """INSERT INTO positions
+               (ticker, city, target_date, side, size_usd, entry_price, current_price, status, strategy_name, opened_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            ("KXHIGHNY-26JUN01-T80", "NYC", "2026-06-01", "YES", 100.0, 0.42, 0.45, "HOLDING", "value_entry", now, now),
+        )
+        conn.commit()
+        markets = [
+            {
+                "ticker": "KXHIGHNY-26JUN01-T80",
+                "market_price": 0.61,
+                "status": "open",
+                "exchange": "kalshi",
+            }
+        ]
+        snapshot = build_exchange_positions_from_markets(conn, markets)
+        assert len(snapshot) == 1
+        assert snapshot[0]["ticker"] == "KXHIGHNY-26JUN01-T80"
+        assert snapshot[0]["current_price"] == pytest.approx(0.61)
+        assert snapshot[0]["side"] == "YES"
+
+    def test_build_exchange_positions_from_markets_ignores_unmatched_tickers(self, tmp_path):
+        conn = _db(tmp_path)
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """INSERT INTO positions
+               (ticker, city, target_date, side, size_usd, entry_price, current_price, status, strategy_name, opened_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            ("KXHIGHNY-26JUN01-T80", "NYC", "2026-06-01", "YES", 100.0, 0.42, 0.45, "HOLDING", "value_entry", now, now),
+        )
+        conn.commit()
+        snapshot = build_exchange_positions_from_markets(conn, [{"ticker": "OTHER", "market_price": 0.5}])
+        assert snapshot == []

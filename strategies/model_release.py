@@ -18,6 +18,7 @@ from strategies.base import BaseStrategy, Signal
 from strategies.value_entry import _build_consensus, _prob_above_threshold
 
 _MIN_DELTA_F = 3.0       # minimum consensus shift to consider signalling
+_MIN_CONFIRMED_MOMENTUM_F = 1.0
 _WATCHED_MODELS = {"GFS", "ECMWF"}
 
 
@@ -50,10 +51,10 @@ class ModelReleaseStrategy(BaseStrategy):
             if not (city and target_date and high_f is not None):
                 continue
 
-            delta, new_consensus, old_run_ids, new_run_ids = _compute_run_delta(
+            delta, new_consensus, old_run_ids, new_run_ids, revision_confirmed, publish_time, fetch_time = _compute_run_delta(
                 forecasts, city, target_date
             )
-            if delta is None or abs(delta) < _MIN_DELTA_F:
+            if delta is None or abs(delta) < _MIN_DELTA_F or not revision_confirmed:
                 continue
 
             fair_value = _prob_above_threshold(new_consensus, high_f, params.base_std_f)
@@ -88,8 +89,14 @@ class ModelReleaseStrategy(BaseStrategy):
                 n_models=n_models,
                 model_temps_f=model_highs,
                 side=side,
-                subtitle=f"model_release delta={delta:+.1f}°F",
+                subtitle=f"model_release delta={delta:+.1f}°F confirmed",
                 is_shadow=True,
+                provider_publish_time=publish_time,
+                model_run_time=new_run_ids[0] if new_run_ids else None,
+                bot_fetch_time=fetch_time,
+                parse_to_signal_time=self._stamp(),
+                revision_confirmed=revision_confirmed,
+                revision_delta_f=delta,
             )
             signals.append(sig)
 
@@ -126,12 +133,16 @@ def _compute_run_delta(
     forecasts: list[ModelForecast],
     city: str,
     target_date: str,
-) -> tuple[float | None, float, list[str], list[str]]:
+) -> tuple[float | None, float, list[str], list[str], bool, str | None, str | None]:
     """
     Compare the most-recent run vs the previous run for watched models.
 
-    Returns (delta_f, new_consensus_f, old_run_ids, new_run_ids).
-    delta_f = new_consensus - old_consensus; None if < 2 runs available.
+    Returns:
+      (delta_f, new_consensus_f, old_run_ids, new_run_ids, revision_confirmed,
+       provider_publish_time, bot_fetch_time)
+
+    revision_confirmed requires the latest run shift to align with the recent
+    run-to-run momentum, reducing false positives from noisy single releases.
     """
     relevant = [
         f for f in forecasts
@@ -141,26 +152,45 @@ def _compute_run_delta(
         and f.run_id
     ]
     if len(relevant) < 2:
-        return None, 0.0, [], []
+        return None, 0.0, [], [], False, None, None
 
-    # Sort by run_id descending (newest first)
     relevant.sort(key=lambda f: f.run_id, reverse=True)
-    newest_run_id = relevant[0].run_id
-
+    run_ids = list(dict.fromkeys(f.run_id for f in relevant))
+    newest_run_id = run_ids[0]
     new_run = [f for f in relevant if f.run_id == newest_run_id]
     old_run = [f for f in relevant if f.run_id != newest_run_id]
-
     if not old_run:
-        return None, 0.0, [], []
+        return None, 0.0, [], [], False, None, None
 
     old_run_id = old_run[0].run_id
     old_run_forecasts = [f for f in old_run if f.run_id == old_run_id]
 
     new_consensus = statistics.mean(f.predicted_high_f for f in new_run)
     old_consensus = statistics.mean(f.predicted_high_f for f in old_run_forecasts)
-
     delta = new_consensus - old_consensus
+
+    revision_confirmed = False
+    if len(run_ids) >= 3:
+        prior_run_id = run_ids[2]
+        prior_run = [f for f in relevant if f.run_id == prior_run_id]
+        if prior_run:
+            prior_consensus = statistics.mean(f.predicted_high_f for f in prior_run)
+            prev_delta = old_consensus - prior_consensus
+            revision_confirmed = (abs(prev_delta) >= _MIN_CONFIRMED_MOMENTUM_F and (delta * prev_delta) > 0)
+    else:
+        # With only two runs, require both watched models to move in same direction.
+        per_model = {}
+        for nf in new_run:
+            of = next((f for f in old_run_forecasts if f.model_name == nf.model_name), None)
+            if of is not None:
+                per_model[nf.model_name] = nf.predicted_high_f - of.predicted_high_f
+        if per_model:
+            signs = {1 if d > 0 else -1 for d in per_model.values() if abs(d) >= 0.5}
+            revision_confirmed = len(signs) == 1 and len(per_model) >= 1
+
     new_ids = list({f.run_id for f in new_run})
     old_ids = list({f.run_id for f in old_run_forecasts})
+    provider_publish_time = max((f.publish_time for f in new_run if f.publish_time), default=None)
+    bot_fetch_time = max((f.fetched_at for f in new_run if f.fetched_at), default=None)
 
-    return delta, new_consensus, old_ids, new_ids
+    return delta, new_consensus, old_ids, new_ids, revision_confirmed, provider_publish_time, bot_fetch_time

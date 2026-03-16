@@ -78,6 +78,7 @@ def init_db(path: Path | None = None) -> sqlite3.Connection:
             predicted_high_f  REAL NOT NULL,
             predicted_low_f   REAL,
             confidence        REAL,
+            ensemble_members_json TEXT,
             run_id            TEXT,
             publish_time      TEXT,
             source_url        TEXT,
@@ -205,6 +206,53 @@ def init_db(path: Path | None = None) -> sqlite3.Connection:
             PRIMARY KEY (city, target_date)
         );
 
+
+
+        CREATE TABLE IF NOT EXISTS decision_audit (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            prediction_id     INTEGER REFERENCES predictions(id),
+            position_id       INTEGER REFERENCES positions(id),
+            strategy_name     TEXT NOT NULL,
+            ticker            TEXT NOT NULL,
+            city              TEXT,
+            target_date       TEXT,
+            provider_publish_time TEXT,
+            model_run_time    TEXT,
+            bot_fetch_time    TEXT,
+            parse_to_signal_time TEXT,
+            market_snapshot_time TEXT,
+            order_sent_time   TEXT,
+            fill_received_time TEXT,
+            revision_confirmed INTEGER NOT NULL DEFAULT 0,
+            revision_delta_f  REAL,
+            source_models     TEXT,
+            created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS calibration_segments (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            computed_at       TEXT NOT NULL DEFAULT (datetime('now')),
+            segment_kind      TEXT NOT NULL,
+            segment_value     TEXT NOT NULL,
+            trade_count       INTEGER NOT NULL DEFAULT 0,
+            avg_brier         REAL,
+            avg_outcome       REAL,
+            avg_prediction    REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS calibration_profiles (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            computed_at       TEXT NOT NULL DEFAULT (datetime('now')),
+            segment_kind      TEXT NOT NULL,
+            segment_value     TEXT NOT NULL,
+            trade_count       INTEGER NOT NULL DEFAULT 0,
+            avg_brier         REAL,
+            avg_outcome       REAL,
+            avg_prediction    REAL,
+            prob_adjustment   REAL NOT NULL DEFAULT 0.0
+        );
+
+
         CREATE TABLE IF NOT EXISTS experiments (
             id            TEXT PRIMARY KEY,
             description   TEXT,
@@ -243,6 +291,7 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "positions", "low_f", "REAL")
     _add_column_if_missing(conn, "positions", "market_type", "TEXT")
     _add_column_if_missing(conn, "positions", "exchange", "TEXT")
+    # decision_audit currently created as a full table above; no incremental columns needed yet
     conn.commit()
 
 

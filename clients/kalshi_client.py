@@ -91,6 +91,43 @@ def fetch_all_weather_markets(
     return markets
 
 
+
+
+def scan_weather_series(
+    session: Optional[requests.Session] = None,
+    timeout: int = 10,
+    extra_series: Optional[list[str]] = None,
+) -> list[dict[str, Any]]:
+    """Best-effort discovery helper for stored/weather dashboard workflows.
+
+    Uses the existing exact-series market fetch path for known weather series and any
+    explicitly supplied extra series tickers. This stays truthful to the currently
+    supported API usage instead of assuming wildcard support.
+    """
+    series = list(WEATHER_SERIES)
+    for s in (extra_series or []):
+        if s and s not in series:
+            series.append(s)
+
+    s = session or requests.Session()
+    discovered: list[dict[str, Any]] = []
+    for series_ticker in series:
+        city = SERIES_CITY.get(series_ticker, series_ticker)
+        try:
+            raw_markets = _fetch_markets_for_series(s, series_ticker, timeout)
+            for m in raw_markets:
+                if m.get("status") != "open":
+                    continue
+                title = (m.get("title") or m.get("subtitle") or "").lower()
+                if not any(term in title for term in ("temp", "temperature", "degrees", "rain", "snow")):
+                    continue
+                parsed = _parse_market(m, city)
+                if parsed:
+                    parsed["discovery_series"] = series_ticker
+                    discovered.append(parsed)
+        except Exception as exc:
+            print(f"[kalshi] discovery error fetching {series_ticker}: {exc}", file=sys.stderr)
+    return discovered
 def fetch_orderbook(
     ticker: str,
     session: Optional[requests.Session] = None,

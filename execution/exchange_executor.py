@@ -34,6 +34,7 @@ class ExchangeExecutor(abc.ABC):
         size_usd: float,
         price: float,
         dry_run: bool = False,
+        depth_usd: float | None = None,
     ) -> dict[str, Any]:
         """
         Place an order on the exchange.
@@ -61,9 +62,9 @@ class PaperExecutor(ExchangeExecutor):
     """
     Paper executor — simulates fills locally, never calls an exchange.
 
-    Used for backtesting and paper trading. Fill is always at the
-    requested price (no slippage model beyond what the signal already
-    incorporated via get_executable_price).
+    Used for backtesting and paper trading. Uses a deterministic depth-aware
+    partial-fill model when estimated depth is available so paper results are
+    a bit less optimistic in thin books.
     """
 
     def place_order(
@@ -73,11 +74,30 @@ class PaperExecutor(ExchangeExecutor):
         size_usd: float,
         price: float,
         dry_run: bool = False,
+        depth_usd: float | None = None,
     ) -> dict[str, Any]:
+        fill_ratio = 1.0
+        if depth_usd is not None and size_usd > 0:
+            fill_ratio = max(0.0, min(1.0, float(depth_usd) / float(size_usd)))
+
+        if fill_ratio <= 0.0:
+            return {
+                "status": "rejected",
+                "fill_price": price,
+                "fill_size_usd": 0.0,
+                "fill_ratio": 0.0,
+                "requested_size_usd": size_usd,
+                "order_id": None,
+                "simulated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        status = "simulated" if fill_ratio >= 0.999 else "partial"
         return {
-            "status": "simulated",
+            "status": status,
             "fill_price": price,
-            "fill_size_usd": size_usd,
+            "fill_size_usd": size_usd * fill_ratio,
+            "fill_ratio": fill_ratio,
+            "requested_size_usd": size_usd,
             "order_id": None,
             "simulated_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -112,6 +132,7 @@ class MakerFirstExecutor(ExchangeExecutor):
         size_usd: float,
         price: float,
         dry_run: bool = False,
+        depth_usd: float | None = None,
     ) -> dict[str, Any]:
         """
         Attempt maker order first. In paper/dry_run, fills at maker price.
@@ -125,15 +146,20 @@ class MakerFirstExecutor(ExchangeExecutor):
             maker_price = min(0.99, price + self.maker_improvement)
 
         if dry_run:
-            # Paper fill at better price — best-case maker simulation
-            return {
-                "status": "simulated_maker",
-                "fill_price": maker_price,
-                "fill_size_usd": size_usd,
-                "order_id": None,
-                "execution_type": "maker",
-                "simulated_at": datetime.now(timezone.utc).isoformat(),
-            }
+            # Paper maker simulation: optimistic on price, conservative on fill ratio.
+            maker_depth = None if depth_usd is None else max(0.0, depth_usd * 0.6)
+            result = self.inner.place_order(
+                ticker=ticker,
+                side=side,
+                size_usd=size_usd,
+                price=maker_price,
+                dry_run=True,
+                depth_usd=maker_depth,
+            )
+            result["execution_type"] = "maker"
+            if result.get("status") == "simulated":
+                result["status"] = "simulated_maker"
+            return result
 
         # Live: delegate to inner executor with maker price
         result = self.inner.place_order(
@@ -142,6 +168,7 @@ class MakerFirstExecutor(ExchangeExecutor):
             size_usd=size_usd,
             price=maker_price,
             dry_run=False,
+            depth_usd=depth_usd,
         )
         result["execution_type"] = "maker"
         result["maker_price"] = maker_price
@@ -181,6 +208,7 @@ class KalshiExecutor(ExchangeExecutor):
         size_usd: float,
         price: float,
         dry_run: bool = False,
+        depth_usd: float | None = None,
     ) -> dict[str, Any]:
         """Place a limit order on Kalshi. Returns fill details."""
         if dry_run:
@@ -188,6 +216,8 @@ class KalshiExecutor(ExchangeExecutor):
                 "status": "simulated",
                 "fill_price": price,
                 "fill_size_usd": size_usd,
+                "fill_ratio": 1.0,
+                "requested_size_usd": size_usd,
                 "order_id": None,
             }
 
@@ -238,5 +268,7 @@ class KalshiExecutor(ExchangeExecutor):
             "status": order.get("status", "unknown"),
             "fill_price": fill_price,
             "fill_size_usd": float(fill_count),
+            "fill_ratio": 1.0,
+            "requested_size_usd": size_usd,
             "order_id": order.get("order_id"),
         }

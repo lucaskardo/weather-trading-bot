@@ -23,6 +23,10 @@ class ModelForecast:
     predicted_high_f: float
     predicted_low_f: Optional[float] = None
     confidence: Optional[float] = None   # 0–1, model-reported or derived
+    # Optional true ensemble members from upstream providers; when present the
+    # canonical fair-value engine uses empirical rank probabilities rather than
+    # smoothing around a point estimate.
+    ensemble_members_f: Optional[list[float]] = None
 
     # Lineage — REQUIRED for audit; default empty str so callers must fill them
     run_id: str = ""          # Model run identifier, e.g. "2026031300" (YYYYMMDDCC)

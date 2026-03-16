@@ -13,6 +13,7 @@ Open-Meteo run_id convention: "YYYYMMDDCC" where CC is the model init cycle hour
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -126,6 +127,9 @@ def fetch_model(city: str, target_date: str, model_name: str) -> ModelForecast:
         "start_date": target_date,
         "end_date": target_date,
         "models": om_model,
+        # Ask upstream for richer ensemble-like metadata when supported; the
+        # parser gracefully ignores these fields when the provider omits them.
+        "hourly": "temperature_2m",
     }
 
     try:
@@ -208,12 +212,73 @@ def _parse_open_meteo(
         predicted_high_f=float(high_f),
         predicted_low_f=float(low_f) if low_f is not None else None,
         confidence=None,
+        ensemble_members_f=_extract_ensemble_members(data, target_date),
         run_id=run_id,
         publish_time=publish_time,
         source_url=source_url,
         fetched_at=fetched_at,
     )
 
+
+# --------------------------------------------------------------------------- #
+# Ensemble extraction
+# --------------------------------------------------------------------------- #
+
+def _extract_ensemble_members(data: dict[str, Any], target_date: str) -> list[float] | None:
+    """Best-effort extraction of true ensemble-member daily highs from provider payloads.
+
+    Supports a few lightweight shapes without assuming a single upstream schema:
+      1. daily.temperature_2m_max_member_* arrays
+      2. daily.temperature_2m_max_members as list[list|float]
+      3. top-level ensemble_members / ensemble_members_f
+
+    Returns a flat list of Fahrenheit daily-high members for target_date, or None.
+    """
+    members: list[float] = []
+    daily = data.get("daily") or {}
+    dates = daily.get("time") or []
+    try:
+        idx = dates.index(target_date)
+    except ValueError:
+        idx = 0
+
+    # Shape 1: member-specific daily keys
+    for key, values in daily.items():
+        if not isinstance(key, str) or "temperature_2m_max" not in key or "member" not in key:
+            continue
+        if isinstance(values, list) and len(values) > idx and values[idx] is not None:
+            try:
+                members.append(float(values[idx]))
+            except Exception:
+                pass
+
+    # Shape 2: nested daily member matrix
+    nested = daily.get("temperature_2m_max_members")
+    if isinstance(nested, list):
+        for item in nested:
+            try:
+                if isinstance(item, list) and len(item) > idx and item[idx] is not None:
+                    members.append(float(item[idx]))
+                elif item is not None:
+                    members.append(float(item))
+            except Exception:
+                pass
+
+    # Shape 3: top-level simple arrays
+    for key in ("ensemble_members_f", "ensemble_members"):
+        vals = data.get(key)
+        if isinstance(vals, list):
+            for item in vals:
+                try:
+                    if isinstance(item, list) and len(item) > idx and item[idx] is not None:
+                        members.append(float(item[idx]))
+                    elif item is not None:
+                        members.append(float(item))
+                except Exception:
+                    pass
+
+    out = [m for m in members if isinstance(m, float)]
+    return out or None
 
 # --------------------------------------------------------------------------- #
 # SQLite persistence
@@ -224,8 +289,8 @@ def _store_forecast(f: ModelForecast, conn: sqlite3.Connection) -> None:
     conn.execute(
         """INSERT INTO forecasts
            (city, target_date, model_name, predicted_high_f, predicted_low_f,
-            confidence, run_id, publish_time, source_url, fetched_at, market_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            confidence, ensemble_members_json, run_id, publish_time, source_url, fetched_at, market_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             f.city,
             f.target_date,
@@ -233,6 +298,7 @@ def _store_forecast(f: ModelForecast, conn: sqlite3.Connection) -> None:
             f.predicted_high_f,
             f.predicted_low_f,
             f.confidence,
+            json.dumps(list(f.ensemble_members_f or [])),
             f.run_id,
             f.publish_time,
             f.source_url,

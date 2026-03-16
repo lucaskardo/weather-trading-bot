@@ -178,6 +178,25 @@ class TestWalkForwardBrier:
         assert 0.0 <= r3 <= 1.0
         assert 0.0 <= r5 <= 1.0
 
+    def test_uses_canonical_compute_fair_value(self, monkeypatch):
+        trades = [{
+            "consensus_f": 82.0,
+            "threshold_f": 80.0,
+            "market_type": "above",
+            "outcome": 1.0,
+        }] * 12
+
+        called = {"n": 0}
+
+        def fake_compute(forecasts, city, target_date, market_type, high_f, low_f, params, conn=None, use_mc=False):
+            called["n"] += 1
+            return 0.75, 82.0, params.base_std_f, 1
+
+        monkeypatch.setattr("research.walk_forward.compute_fair_value", fake_compute)
+        result = walk_forward_brier({"base_std_f": 5.0, "temp_T": 1.0}, trades, n_windows=3)
+        assert 0.0 <= result <= 1.0
+        assert called["n"] > 0
+
 
 class TestWalkForwardVariance:
     def test_returns_zero_with_single_fold(self):

@@ -279,6 +279,19 @@ def compute_fair_value(
     consensus_f = _st.mean(highs)
     agreement = _st.stdev(highs) if len(highs) > 1 else 0.0
 
+    ensemble_samples: list[float] = []
+    for f, corrected_high in zip(relevant, highs):
+        members = getattr(f, "ensemble_members_f", None) or []
+        if not members:
+            continue
+        delta = corrected_high - float(f.predicted_high_f)
+        ensemble_samples.extend([float(m) + delta for m in members])
+
+    # When true ensemble members are available, use their empirical spread as the
+    # uncertainty input and their rank probabilities as the primary fair value.
+    if ensemble_samples:
+        agreement = _st.stdev(ensemble_samples) if len(ensemble_samples) > 1 else agreement
+
     std_f = dynamic_std_f(
         city=city,
         target_date=target_date,
@@ -287,7 +300,10 @@ def compute_fair_value(
         base_std_f=getattr(params, "base_std_f", 5.0),
     )
 
-    if use_mc and highs:
+    use_empirical = bool(ensemble_samples) and getattr(params, "use_empirical_ensemble", True)
+    if use_empirical:
+        fair_value = empirical_prob_for_market(ensemble_samples, market_type, high_f, low_f)
+    elif use_mc and highs:
         fair_value = monte_carlo_prob(
             model_forecasts=highs,
             market_type=market_type,
@@ -307,7 +323,81 @@ def compute_fair_value(
         logit = math.log(fair_value / (1.0 - fair_value))
         fair_value = 1.0 / (1.0 + math.exp(-logit / T))
 
+    fair_value += _segment_probability_adjustment(conn, market_type, lead_hours, agreement, city)
     return max(0.01, min(0.99, fair_value)), consensus_f, std_f, len(highs)
+
+
+def empirical_prob_for_market(
+    samples_f: list[float],
+    market_type: str,
+    high_f: float | None,
+    low_f: float | None,
+) -> float | None:
+    """Empirical P(YES) from true ensemble-member temperatures when available."""
+    if not samples_f:
+        return None
+    mtype = (market_type or "above").lower()
+    hits = 0
+    total = len(samples_f)
+    for x in samples_f:
+        if mtype == "band":
+            if low_f is not None and high_f is not None and (low_f - 0.5) <= x <= (high_f + 0.5):
+                hits += 1
+        elif mtype == "below":
+            if high_f is not None and x <= (high_f + 0.5):
+                hits += 1
+        else:
+            if high_f is not None and x >= (high_f - 0.5):
+                hits += 1
+    return max(0.01, min(0.99, hits / total)) if total else None
+
+
+def lead_bucket_from_hours(lead_hours: float) -> str:
+    if lead_hours < 12:
+        return "short"
+    if lead_hours < 48:
+        return "medium"
+    return "long"
+
+
+def regime_bucket(agreement: float, market_type: str = "above") -> str:
+    mtype = (market_type or "above").lower()
+    if agreement >= 5.0:
+        prefix = "high_disagreement"
+    elif agreement >= 3.0:
+        prefix = "moderate_disagreement"
+    else:
+        prefix = "calm"
+    return f"{prefix}:{mtype}"
+
+
+def _segment_probability_adjustment(conn, market_type: str, lead_hours: float, agreement: float, city: str = "") -> float:
+    """Return the average stored calibration adjustment for this trade segment."""
+    if conn is None:
+        return 0.0
+    try:
+        segments = [
+            ("market_type", (market_type or "above").lower()),
+            ("lead_bucket", lead_bucket_from_hours(lead_hours)),
+            ("regime", regime_bucket(agreement, market_type)),
+            ("city", city),
+        ]
+        adjustments: list[float] = []
+        for kind, value in segments:
+            row = conn.execute(
+                """SELECT prob_adjustment FROM calibration_profiles
+                   WHERE segment_kind = ? AND segment_value = ?
+                   ORDER BY computed_at DESC, id DESC LIMIT 1""",
+                (kind, value),
+            ).fetchone()
+            if row is not None and row[0] is not None:
+                adjustments.append(float(row[0]))
+        if not adjustments:
+            return 0.0
+        adj = sum(adjustments) / len(adjustments)
+        return max(-0.15, min(0.15, adj))
+    except Exception:
+        return 0.0
 
 
 def brier_score(predicted: float, outcome: float) -> float:

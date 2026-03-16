@@ -13,12 +13,55 @@ calibrated parameters generalise to unseen data.
 from __future__ import annotations
 
 import math
+from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any, Callable
 
-from core.forecaster import (
-    brier_score, prob_above_threshold,
-    _compute_fair_value_for_market, temperature_scale,
-)
+from core.forecaster import brier_score, compute_fair_value
+from shared.params import PARAMS
+from shared.types import ModelForecast
+
+
+def _trade_predicted_prob(trade: dict[str, Any], params_candidate: dict[str, float]) -> float | None:
+    """Recompute a trade probability using the canonical fair-value pipeline."""
+    consensus_f = trade.get("consensus_f")
+    high_f = trade.get("high_f") or trade.get("threshold_f")
+    low_f = trade.get("low_f")
+    market_type = trade.get("market_type") or "above"
+    if consensus_f is None or high_f is None:
+        return None
+
+    city = trade.get("city") or "SYN"
+    target_date = trade.get("target_date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    ts = datetime.now(timezone.utc).isoformat()
+    fake_forecast = ModelForecast(
+        model_name="consensus",
+        city=city,
+        target_date=target_date,
+        predicted_high_f=float(consensus_f),
+        run_id="walkforward",
+        publish_time=ts,
+        source_url="walkforward://synthetic",
+        fetched_at=ts,
+    )
+    params = replace(
+        PARAMS,
+        base_std_f=float(params_candidate.get("base_std_f", PARAMS.base_std_f)),
+        temp_scaling_T=float(params_candidate.get("temp_T", params_candidate.get("temp_scaling_T", PARAMS.temp_scaling_T))),
+        use_monte_carlo=False,
+    )
+    fv, _, _, _ = compute_fair_value(
+        [fake_forecast],
+        city,
+        target_date,
+        market_type,
+        float(high_f),
+        float(low_f) if low_f is not None else None,
+        params,
+        conn=None,
+        use_mc=False,
+    )
+    return fv
 
 
 def walk_forward_brier(
@@ -40,8 +83,6 @@ def walk_forward_brier(
         Average out-of-sample Brier score (lower is better).
         Returns 0.25 (random baseline) if insufficient data.
     """
-    base_std_f = params_candidate.get("base_std_f", 5.0)
-    temp_T = params_candidate.get("temp_T", 1.0)
 
     if len(trade_log) < n_windows + 1:
         return 0.25  # not enough data — return random baseline
@@ -63,24 +104,13 @@ def walk_forward_brier(
 
         fold_briers: list[float] = []
         for trade in test_trades:
-            consensus_f = trade.get("consensus_f")
-            high_f = trade.get("high_f") or trade.get("threshold_f")
-            low_f = trade.get("low_f")
-            market_type = trade.get("market_type") or "above"
             outcome = trade.get("outcome")
-
-            if consensus_f is None or high_f is None or outcome is None:
+            if outcome is None:
                 continue
 
-            raw_pred = _compute_fair_value_for_market(
-                float(consensus_f), market_type,
-                float(high_f),
-                float(low_f) if low_f is not None else None,
-                float(base_std_f),
-            )
-            if raw_pred is None:
+            pred = _trade_predicted_prob(trade, params_candidate)
+            if pred is None:
                 continue
-            pred = temperature_scale(raw_pred, float(temp_T))
             fold_briers.append(brier_score(pred, float(outcome)))
 
         if fold_briers:
@@ -101,8 +131,6 @@ def walk_forward_variance(
     Compute variance of per-fold Brier scores.
     High variance signals overfitting / instability.
     """
-    base_std_f = params_candidate.get("base_std_f", 5.0)
-    temp_T = params_candidate.get("temp_T", 1.0)
 
     if len(trade_log) < n_windows + 1:
         return 0.0
@@ -118,22 +146,12 @@ def walk_forward_variance(
 
         fold_briers = []
         for trade in test_trades:
-            consensus_f = trade.get("consensus_f")
-            high_f = trade.get("high_f") or trade.get("threshold_f")
-            low_f = trade.get("low_f")
-            market_type = trade.get("market_type") or "above"
             outcome = trade.get("outcome")
-            if None in (consensus_f, high_f, outcome):
+            if outcome is None:
                 continue
-            raw_pred = _compute_fair_value_for_market(
-                float(consensus_f), market_type,
-                float(high_f),
-                float(low_f) if low_f is not None else None,
-                float(base_std_f),
-            )
-            if raw_pred is None:
+            pred = _trade_predicted_prob(trade, params_candidate)
+            if pred is None:
                 continue
-            pred = temperature_scale(raw_pred, float(temp_T))
             fold_briers.append(brier_score(pred, float(outcome)))
 
         if fold_briers:

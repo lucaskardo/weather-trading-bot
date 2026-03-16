@@ -56,6 +56,18 @@ class Signal:
     is_shadow: bool = False    # shadow signals log only — never execute
     side: str = "YES"          # "YES" | "NO"
 
+    # --- Timestamp doctrine / provenance ---
+    provider_publish_time: Optional[str] = None
+    model_run_time: Optional[str] = None
+    bot_fetch_time: Optional[str] = None
+    parse_to_signal_time: Optional[str] = None
+    market_snapshot_time: Optional[str] = None
+    order_sent_time: Optional[str] = None
+    fill_received_time: Optional[str] = None
+    revision_confirmed: bool = False
+    revision_delta_f: Optional[float] = None
+    execution_depth_usd: Optional[float] = None
+
 
 class BaseStrategy(abc.ABC):
     """

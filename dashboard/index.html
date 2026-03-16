@@ -52,6 +52,18 @@
     .bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
     .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
     .section-header h2 { font-size: 16px; font-weight: 600; }
+    .pill { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; font-size:12px; font-weight:600; }
+    .pill.good { background:#1f4d36; color:#9ae6b4; }
+    .pill.warn { background:#5a3b12; color:#f6ad55; }
+    .pill.bad { background:#5b1d1d; color:#feb2b2; }
+    .subtle { color:#94a3b8; font-size:12px; }
+    .clickable { cursor:pointer; }
+    .clickable:hover td { background:#2a3150; }
+    .modal-backdrop { position:fixed; inset:0; background:rgba(0,0,0,0.6); display:flex; align-items:center; justify-content:center; padding:16px; z-index:1000; }
+    .modal { width:min(760px, 100%); max-height:90vh; overflow:auto; background:#151a2c; border:1px solid #334155; border-radius:14px; padding:20px; box-shadow:0 10px 30px rgba(0,0,0,0.35); }
+    .btn { background:#2563eb; color:#fff; border:none; padding:8px 14px; border-radius:8px; cursor:pointer; font-size:13px; }
+    .btn.secondary { background:#334155; color:#cbd5e1; }
+    .input { background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:8px; padding:8px 10px; font-size:13px; }
   </style>
 </head>
 <body>
@@ -59,16 +71,26 @@
 <script type="text/babel">
 const API = "http://localhost:5001/api";
 
-function useApi(endpoint, deps = []) {
+function useApi(endpoint, deps = [], pollMs = 0) {
   const [data, setData] = React.useState(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState(null);
   React.useEffect(() => {
-    setLoading(true);
-    fetch(API + endpoint)
-      .then(r => r.json())
-      .then(d => { setData(d); setLoading(false); })
-      .catch(e => { setError(e.message); setLoading(false); });
+    let cancelled = false;
+    async function load() {
+      try {
+        if (!cancelled) setLoading(true);
+        const r = await fetch(API + endpoint);
+        const d = await r.json();
+        if (!cancelled) { setData(d); setError(null); setLoading(false); }
+      } catch (e) {
+        if (!cancelled) { setError(e.message); setLoading(false); }
+      }
+    }
+    load();
+    let timer = null;
+    if (pollMs > 0) timer = setInterval(load, pollMs);
+    return () => { cancelled = true; if (timer) clearInterval(timer); };
   }, deps);
   return { data, loading, error };
 }
@@ -239,15 +261,171 @@ function DailyBarsChart({ daily }) {
   return <canvas ref={ref} height={120} />;
 }
 
+
+
+function MetricPill({ label, value, tone="good" }) {
+  return <span className={`pill ${tone}`}>{label}: {value}</span>;
+}
+
+function DecisionModal({ row, onClose }) {
+  if (!row) return null;
+  const spread = row.agreement != null ? `${fmt(row.agreement, 2)}°F model spread` : "No spread yet";
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="section-header">
+          <h2>{row.contract} · {row.city} · {row.target_date}</h2>
+          <button className="btn secondary" onClick={onClose}>Close</button>
+        </div>
+        <div className="grid grid-3" style={{marginBottom:16}}>
+          <div className="card"><h3>Bot Fair %</h3><div className="stat-value">{fmt((row.fair_prob || 0) * 100, 1)}%</div></div>
+          <div className="card"><h3>Market ¢</h3><div className="stat-value">{fmt((row.market_price || 0) * 100, 1)}</div></div>
+          <div className="card"><h3>Executable Edge</h3><div className={`stat-value ${((row.executable_edge ?? row.edge) || 0) >= 0 ? 'pos' : 'neg'}`}>{fmt(((row.executable_edge ?? row.edge) || 0) * 100, 1)}%</div></div>
+        </div>
+        <div className="grid grid-2">
+          <div className="card">
+            <h3>Why this trade is here</h3>
+            <div className="subtle" style={{lineHeight:1.7}}>
+              <div><strong>Recommended action:</strong> {row.recommended_action}</div>
+              <div><strong>Suggested size:</strong> ${fmt(row.suggested_usd)}</div>
+              <div><strong>Confidence:</strong> {fmt((row.confidence || 0) * 100, 1)}%</div>
+              <div><strong>Freshness:</strong> {row.stale ? 'Stale — double check before acting' : 'Fresh'}</div>
+              <div><strong>Consensus / spread:</strong> {row.consensus_f != null ? `${fmt(row.consensus_f,1)}°F` : '—'} · {spread}</div>
+            </div>
+          </div>
+          <div className="card">
+            <h3>How to read it</h3>
+            <div className="subtle" style={{lineHeight:1.7}}>
+              <div>Green rows are the strongest edges right now.</div>
+              <div>Amber rows are tradable but less attractive.</div>
+              <div>Red or stale rows should usually be ignored.</div>
+              <div>This table already includes executable-price logic, not just raw fair value.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DecisionCockpit() {
+  const { data, loading, error } = useApi('/decisions?limit=20', [], 30000);
+  const [selected, setSelected] = React.useState(null);
+  if (loading && !data) return <div className="card"><div className="loading">Loading live decisions…</div></div>;
+  const rows = data || [];
+  return (
+    <>
+    <div className="card">
+      <div className="section-header">
+        <h2>Decision Cockpit</h2>
+        <div className="subtle">Auto-refreshes every 30s · Click a row for details</div>
+      </div>
+      {error && <div className="error-msg">{error}</div>}
+      <table>
+        <thead><tr><th>Contract</th><th>City</th><th>Bot Fair %</th><th>Market ¢</th><th>Edge %</th><th>Suggested $</th><th>Fresh</th><th>Action</th></tr></thead>
+        <tbody>
+          {rows.map((r, i) => {
+            const edge = ((r.executable_edge ?? r.edge) || 0) * 100;
+            const cls = edge >= 10 ? 'pos' : edge >= 5 ? 'neutral' : 'neg';
+            return <tr key={i} className="clickable" onClick={() => setSelected(r)}>
+              <td style={{fontFamily:'monospace', fontSize:12}}>{r.contract}</td>
+              <td>{r.city}</td>
+              <td>{fmt((r.fair_prob || 0) * 100, 1)}%</td>
+              <td>{fmt((r.market_price || 0) * 100, 1)}</td>
+              <td className={cls}>{edge >= 0 ? '+' : ''}{fmt(edge, 1)}%</td>
+              <td>${fmt(r.suggested_usd)}</td>
+              <td>{r.stale ? <span className="pill warn">stale</span> : <span className="pill good">fresh</span>}</td>
+              <td><strong>{r.recommended_action}</strong></td>
+            </tr>;
+          })}
+          {rows.length === 0 && <tr><td colSpan={8} style={{textAlign:'center', color:'#718096', padding:24}}>No actionable decisions stored yet</td></tr>}
+        </tbody>
+      </table>
+    </div>
+    <DecisionModal row={selected} onClose={() => setSelected(null)} />
+    </>
+  );
+}
+
+function TruthCenter() {
+  const { data: truth } = useApi('/truth', [], 30000);
+  const { data: sources } = useApi('/source_health', [], 60000);
+  const { data: risk } = useApi('/portfolio_risk', [], 30000);
+  const { data: brief } = useApi('/operator_brief', [], 30000);
+  return (
+    <div className="grid grid-2">
+      <div className="card">
+        <div className="section-header"><h2>Truth Center</h2><div className="subtle">What to trust right now</div></div>
+        <div style={{display:'flex', gap:8, flexWrap:'wrap', marginBottom:12}}>
+          <MetricPill label="Brier 30d" value={truth?.overall_brier_30d != null ? fmt(truth.overall_brier_30d,3) : '—'} tone={(truth?.overall_brier_30d ?? 1) < 0.19 ? 'good' : (truth?.overall_brier_30d ?? 1) < 0.23 ? 'warn' : 'bad'} />
+          <MetricPill label="Sources stale" value={brief?.stale_sources ?? 0} tone={(brief?.stale_sources ?? 0) === 0 ? 'good' : 'warn'} />
+          <MetricPill label="VaR95" value={risk?.var95_pct != null ? `${fmt(risk.var95_pct * 100,1)}%` : '—'} tone={(risk?.var95_pct ?? 1) < (risk?.limit_pct ?? 0.1) ? 'good' : 'warn'} />
+        </div>
+        <div className="subtle" style={{lineHeight:1.8}}>
+          <div><strong>Settlements:</strong> {truth?.last_settlement_badge || 'No settlements yet'}</div>
+          <div><strong>Resolved predictions:</strong> {truth?.resolved_predictions ?? 0}</div>
+          <div><strong>Top opportunity:</strong> {brief?.top_decision?.contract || 'No current edge'}</div>
+        </div>
+      </div>
+      <div className="card">
+        <div className="section-header"><h2>Source Freshness</h2><div className="subtle">Latest fetches</div></div>
+        <table>
+          <thead><tr><th>Model</th><th>Last Fetch</th><th>Hours</th><th>Status</th></tr></thead>
+          <tbody>
+            {(sources || []).slice(0,6).map((s, i) => {
+              const hrs = Number(s.hours_since_fetch || 0);
+              return <tr key={i}>
+                <td>{s.model_name}</td>
+                <td style={{fontSize:11}}>{(s.last_fetched_at || '').substring(0,16)}</td>
+                <td>{fmt(hrs, 1)}</td>
+                <td>{hrs <= 6 ? <span className="pill good">fresh</span> : hrs <= 18 ? <span className="pill warn">aging</span> : <span className="pill bad">stale</span>}</td>
+              </tr>;
+            })}
+            {(!sources || sources.length === 0) && <tr><td colSpan={4} style={{textAlign:'center', color:'#718096', padding:18}}>No forecast sources stored yet</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function MarketExplorerCard() {
+  const [q, setQ] = React.useState('');
+  const endpoint = q ? `/market_explorer?limit=12&q=${encodeURIComponent(q)}` : '/market_explorer?limit=12';
+  const { data } = useApi(endpoint, [q], 60000);
+  return (
+    <div className="card">
+      <div className="section-header">
+        <h2>Market Explorer</h2>
+        <input className="input" placeholder="Filter by city, ticker, type…" value={q} onChange={e => setQ(e.target.value)} />
+      </div>
+      <table>
+        <thead><tr><th>Ticker</th><th>City</th><th>Date</th><th>Type</th><th>Exchange</th><th>Status</th></tr></thead>
+        <tbody>
+          {(data || []).map((m, i) => <tr key={i}>
+            <td style={{fontFamily:'monospace', fontSize:12}}>{m.ticker}</td>
+            <td>{m.city}</td>
+            <td>{m.target_date}</td>
+            <td>{m.market_type}</td>
+            <td>{m.exchange}</td>
+            <td><StatusTag status={m.status} /></td>
+          </tr>)}
+          {(!data || data.length === 0) && <tr><td colSpan={6} style={{textAlign:'center', color:'#718096', padding:18}}>No stored markets match this search</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 // ─── Tab 1: Live Trading ────────────────────────────────────────────────────
 function Tab1() {
-  const { data: portfolio } = useApi("/portfolio");
-  const { data: positions, loading: posLoading } = useApi("/positions?status=open&limit=50");
-  const { data: recent } = useApi("/trades/recent?limit=20");
-  const { data: allocations } = useApi("/allocations");
-  const { data: clusters } = useApi("/cluster_exposure");
-  const { data: qs } = useApi("/quick_stats");
-  const { data: daily } = useApi("/daily_pnl");
+  const { data: portfolio } = useApi("/portfolio", [], 30000);
+  const { data: positions, loading: posLoading } = useApi("/positions?status=open&limit=50", [], 30000);
+  const { data: recent } = useApi("/trades/recent?limit=20", [], 30000);
+  const { data: allocations } = useApi("/allocations", [], 30000);
+  const { data: clusters } = useApi("/cluster_exposure", [], 30000);
+  const { data: qs } = useApi("/quick_stats", [], 30000);
+  const { data: daily } = useApi("/daily_pnl", [], 30000);
 
   const bankroll = portfolio?.bankroll ?? 0;
   const totalPnl = portfolio?.total_pnl ?? 0;
@@ -255,6 +433,9 @@ function Tab1() {
   return (
     <div className="grid" style={{gap: 20}}>
       <LastCyclePanel />
+      <TruthCenter />
+      <DecisionCockpit />
+      <MarketExplorerCard />
       {/* KPI row */}
       <div className="grid grid-4">
         <div className="card">
@@ -736,11 +917,13 @@ function App() {
   const [lastUpdate, setLastUpdate] = React.useState(new Date().toLocaleTimeString());
   const tabs = ["Live Trading", "Strategy Performance", "Autoresearch", "Forecast Quality", "History"];
 
+  React.useEffect(() => {
+    const timer = setInterval(() => setLastUpdate(new Date().toLocaleTimeString()), 30000);
+    return () => clearInterval(timer);
+  }, []);
+
   function refresh() {
-    setLastUpdate(new Date().toLocaleTimeString());
-    // Force re-render by toggling tab
-    setTab(t => t);
-    window.location.reload();
+    fetch(API + '/refresh').finally(() => setLastUpdate(new Date().toLocaleTimeString()));
   }
 
   return (

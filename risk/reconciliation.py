@@ -268,6 +268,45 @@ def check_orphaned_orders(
     return orphans
 
 
+def build_exchange_positions_from_markets(
+    conn: sqlite3.Connection,
+    markets: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build a lightweight exchange-position snapshot from live market data.
+
+    This is intended for non-destructive reconciliation smoke checks when full
+    authenticated position endpoints are unavailable or intentionally avoided.
+    It maps local open positions to the latest fetched market snapshots by
+    ticker and carries forward local side/size while using live market price as
+    the current exchange price.
+    """
+    local_rows = conn.execute(
+        """SELECT ticker, city, target_date, side, size_usd, entry_price, status, strategy_name
+           FROM positions
+           WHERE status IN ('OPENED','HOLDING','TAKE_PROFIT_PARTIAL')"""
+    ).fetchall()
+    market_by_ticker = {str(m.get('ticker', '')): m for m in markets}
+    snapshot: list[dict[str, Any]] = []
+    for r in local_rows:
+        ticker = str(r['ticker'])
+        m = market_by_ticker.get(ticker)
+        if not m:
+            continue
+        snapshot.append({
+            'ticker': ticker,
+            'city': r['city'],
+            'target_date': r['target_date'],
+            'side': r['side'],
+            'size_usd': float(r['size_usd'] or 0.0),
+            'entry_price': float(r['entry_price'] or 0.0),
+            'current_price': float(m.get('market_price') or 0.0),
+            'status': 'OPEN' if str(m.get('status', 'open')).lower() == 'open' else str(m.get('status', '')).upper(),
+            'strategy_name': r['strategy_name'],
+            'exchange': m.get('exchange', ''),
+        })
+    return snapshot
+
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #

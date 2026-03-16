@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 from shared.params import Params, PARAMS
 from shared.types import ModelForecast
+from execution.orderbook import get_exit_price
 
 
 class PositionStatus(str, Enum):
@@ -140,6 +141,7 @@ def process_position(
     side = position.get("side", "YES")
     entry_price = position.get("entry_price", 0.5)
     current_price = position.get("current_price", entry_price)
+    net_exit_value = get_exit_price(current_price, side, params)
     high_f = position.get("high_f")
     low_f = position.get("low_f")
     market_type = position.get("market_type", "above")
@@ -176,9 +178,9 @@ def process_position(
     # --- Exit Rule 2: Forecast reversal (stop loss) ---
     if updated_fair_value is not None:
         if side == "YES":
-            updated_edge = updated_fair_value - current_price
+            updated_edge = updated_fair_value - net_exit_value
         else:
-            updated_edge = (1 - updated_fair_value) - (1 - current_price)
+            updated_edge = (1 - updated_fair_value) - net_exit_value
         if updated_edge < -0.05:
             return LifecycleAction(
                 position_id=pos_id,
@@ -192,7 +194,8 @@ def process_position(
 
     # --- Exit Rule 3: Convergence ---
     if updated_fair_value is not None:
-        if abs(current_price - updated_fair_value) < 0.03:
+        target_value = updated_fair_value if side == "YES" else (1 - updated_fair_value)
+        if abs(net_exit_value - target_value) < 0.03:
             return LifecycleAction(
                 position_id=pos_id,
                 current_status=status,
@@ -206,7 +209,7 @@ def process_position(
     # --- Exit Rule 4: Pre-settlement thin edge ---
     hours_left = _hours_to_settlement(target_date)
     if hours_left is not None and hours_left < 4:
-        unrealized = (current_price - entry_price) if side == "YES" else (entry_price - current_price)
+        unrealized = net_exit_value - entry_price
         if unrealized < 0.03:
             return LifecycleAction(
                 position_id=pos_id,

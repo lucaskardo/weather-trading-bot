@@ -8,6 +8,7 @@ Guards:
   check_stale_forecast()    — HALT if best available forecast is too old
   check_cluster_exposure()  — REJECT trade if cluster cap would be breached
   check_daily_loss_limit()  — HALT if today's loss exceeds the daily limit
+  check_portfolio_var_limit() — REJECT trade if proxy VaR95 would be breached
 """
 
 from __future__ import annotations
@@ -42,6 +43,10 @@ class DailyLossHalt(RiskViolation):
 
 class CityLimitExceeded(RiskViolation):
     """Raised when per-city position limit would be breached."""
+
+
+class PortfolioVaRExceeded(RiskViolation):
+    """Raised when proxy portfolio VaR95 would be breached."""
 
 
 # --------------------------------------------------------------------------- #
@@ -180,6 +185,97 @@ def check_city_limit(
         )
 
 
+
+
+def check_city_exposure(
+    city: str,
+    proposed_size_usd: float,
+    open_positions: list[dict[str, Any]],
+    bankroll: float,
+    params: Params = PARAMS,
+) -> None:
+    """Raise if gross city exposure would breach max_city_exposure_pct."""
+    current_exposure = sum(float(p.get("size_usd", 0.0) or 0.0) for p in open_positions if p.get("city") == city)
+    cap_usd = params.max_city_exposure_pct * bankroll
+    if current_exposure + proposed_size_usd > cap_usd:
+        raise CityLimitExceeded(
+            f"City '{city}' gross exposure would be ${current_exposure + proposed_size_usd:.2f} "
+            f"(cap=${cap_usd:.2f}, bankroll=${bankroll:.2f}). Trade rejected."
+        )
+
+
+def _market_temp_sign(market_type: str) -> float:
+    m = (market_type or "above").lower()
+    if m == "below":
+        return -1.0
+    if m == "band":
+        return 0.5
+    return 1.0
+
+
+def _position_temp_delta(position: dict[str, Any]) -> float:
+    """Proxy PnL sensitivity to a 1-sigma temperature shock in USD.
+
+    This is intentionally conservative and lightweight rather than a full derivative model.
+    """
+    size_usd = float(position.get("size_usd", 0.0) or 0.0)
+    side_sign = 1.0 if (position.get("side") or "YES").upper() == "YES" else -1.0
+    market_sign = _market_temp_sign(position.get("market_type") or "above")
+    # Scale notional to a proxy daily shock; avoids treating full notional as 1F delta.
+    return 0.20 * size_usd * side_sign * market_sign
+
+
+def _pairwise_temp_corr(a: dict[str, Any], b: dict[str, Any], params: Params = PARAMS) -> float:
+    city_a = a.get("city", "")
+    city_b = b.get("city", "")
+    if city_a and city_a == city_b:
+        return params.same_city_corr
+    cluster_a = get_cluster(city_a, params)
+    cluster_b = get_cluster(city_b, params)
+    if cluster_a and cluster_a == cluster_b:
+        return params.same_cluster_corr
+    return params.cross_cluster_corr
+
+
+def estimate_portfolio_var95(
+    open_positions: list[dict[str, Any]],
+    bankroll: float,
+    proposed_position: Optional[dict[str, Any]] = None,
+    params: Params = PARAMS,
+) -> float:
+    """Estimate a lightweight 95% one-day VaR in USD using proxy payoff deltas and city correlations."""
+    items = [dict(p) for p in open_positions]
+    if proposed_position is not None:
+        items.append(dict(proposed_position))
+    if not items or bankroll <= 0:
+        return 0.0
+
+    deltas = [_position_temp_delta(p) for p in items]
+    variance = 0.0
+    for i, a in enumerate(items):
+        for j, b in enumerate(items):
+            corr = 1.0 if i == j else _pairwise_temp_corr(a, b, params)
+            variance += deltas[i] * deltas[j] * corr
+    variance = max(0.0, variance)
+    return 1.65 * (variance ** 0.5)
+
+
+def check_portfolio_var_limit(
+    open_positions: list[dict[str, Any]],
+    bankroll: float,
+    proposed_position: Optional[dict[str, Any]] = None,
+    params: Params = PARAMS,
+) -> float:
+    """Raise PortfolioVaRExceeded if proxy portfolio VaR95 exceeds configured bankroll fraction."""
+    var95_usd = estimate_portfolio_var95(open_positions, bankroll, proposed_position, params)
+    cap_usd = params.max_portfolio_var95_pct * bankroll
+    if var95_usd > cap_usd:
+        raise PortfolioVaRExceeded(
+            f"Proxy portfolio VaR95 would be ${var95_usd:.2f} "
+            f"(cap=${cap_usd:.2f}, bankroll=${bankroll:.2f}). Trade rejected."
+        )
+    return var95_usd
+
 # --------------------------------------------------------------------------- #
 # Guard 3: Daily Loss Limit
 # --------------------------------------------------------------------------- #
@@ -226,7 +322,12 @@ def check_daily_loss_limit(
             unrealized_loss += abs(mtm)
 
     total_loss = realized_loss + unrealized_loss
-    limit_usd = max_loss_pct * bankroll
+    import os as _os
+    daily_limit_env = _os.environ.get("DAILY_LOSS_LIMIT")
+    if daily_limit_env is not None:
+        limit_usd = float(daily_limit_env)
+    else:
+        limit_usd = max_loss_pct * bankroll
 
     if total_loss >= limit_usd:
         raise DailyLossHalt(

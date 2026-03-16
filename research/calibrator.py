@@ -23,8 +23,7 @@ from typing import Any
 
 from clients.nws_settlement import fetch_settlement, SettlementError
 from core.forecaster import (
-    brier_decomposition, prob_above_threshold,
-    _compute_fair_value_for_market, temperature_scale, compute_fair_value,
+    brier_decomposition, compute_fair_value, lead_bucket_from_hours, regime_bucket,
 )
 from research.walk_forward import walk_forward_brier
 from research.optimizer import optimize_params, save_params, OptimizerResult
@@ -43,6 +42,7 @@ class CalibrationResult:
         new_params: dict[str, float],
         optimizer_result: OptimizerResult | None,
         resolved_count: int,
+        segment_metrics: dict[str, list[dict[str, Any]]] | None = None,
     ):
         self.n_trades = n_trades
         self.brier = brier
@@ -51,6 +51,7 @@ class CalibrationResult:
         self.new_params = new_params
         self.optimizer_result = optimizer_result
         self.resolved_count = resolved_count
+        self.segment_metrics = segment_metrics or {}
 
     def __repr__(self) -> str:
         return (
@@ -110,6 +111,7 @@ def run_calibration(
             new_params=old_params,
             optimizer_result=None,
             resolved_count=newly_resolved,
+            segment_metrics={},
         )
 
     # Step 3: Compute Brier decomposition on current params
@@ -127,20 +129,27 @@ def run_calibration(
             # Use the same math the live strategy uses: dynamic_std + temp_scaling
             # No conn → no bias correction (we're testing parameter sensitivity, not bias)
             from shared.types import ModelForecast
+            city = t.get("city") or "SYN"
+            target_date = t.get("target_date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            ts = datetime.now(timezone.utc).isoformat()
             fake_forecast = ModelForecast(
-                city=t.get("city", ""),
-                target_date=t.get("target_date", ""),
+                city=city,
+                target_date=target_date,
                 model_name="consensus",
                 predicted_high_f=float(t["consensus_f"]),
+                run_id="calibration",
+                publish_time=ts,
+                source_url="calibration://recompute",
+                fetched_at=ts,
             )
             fv, _, _, _ = compute_fair_value(
                 [fake_forecast],
-                t.get("city", ""), t.get("target_date", ""),
+                city, target_date,
                 market_type,
                 float(high_f) if high_f is not None else None,
                 float(low_f) if low_f is not None else None,
                 params,
-                conn=None, use_mc=False,
+                conn=conn, use_mc=False,
             )
             pred = fv if fv is not None else (t.get("fair_value", 0.5) or 0.5)
         else:
@@ -154,6 +163,7 @@ def run_calibration(
         f"index={decomp['brier_index']:.1f} "
         f"(reliability={decomp['reliability']:.4f}, resolution={decomp['resolution']:.4f})"
     )
+    segment_metrics = _compute_segment_metrics(trade_log, predictions, outcomes)
 
     # Step 4: Walk-forward optimization
     opt_result = optimize_params(
@@ -168,6 +178,7 @@ def run_calibration(
     # Step 5: Persist (never mutate the passed params — caller decides what to apply)
     if save:
         _save_to_db(conn, decomp, new_params)
+        _save_segment_metrics(conn, segment_metrics)
         save_params(new_params, params_path)
 
     _log(
@@ -183,12 +194,84 @@ def run_calibration(
         new_params=new_params,
         optimizer_result=opt_result,
         resolved_count=newly_resolved,
+        segment_metrics=segment_metrics,
     )
 
 
 # --------------------------------------------------------------------------- #
 # Internal helpers
 # --------------------------------------------------------------------------- #
+
+
+def _trade_lead_hours(target_date: str | None) -> float:
+    if not target_date:
+        return 48.0
+    try:
+        eod = datetime.fromisoformat(f"{target_date}T23:59:59+00:00")
+        return max(0.0, (eod - datetime.now(timezone.utc)).total_seconds() / 3600)
+    except Exception:
+        return 48.0
+
+
+def _compute_segment_metrics(trade_log: list[dict[str, Any]], predictions: list[float], outcomes: list[float]) -> dict[str, list[dict[str, Any]]]:
+    segment_buckets: dict[tuple[str, str], list[tuple[float, float]]] = {}
+    for trade, pred, outcome in zip(trade_log, predictions, outcomes):
+        mtype = (trade.get("market_type") or "above").lower()
+        lead_seg = lead_bucket_from_hours(_trade_lead_hours(trade.get("target_date")))
+        regime_seg = regime_bucket(float(trade.get("agreement") or 0.0), mtype)
+        for kind, value in (("market_type", mtype), ("lead_bucket", lead_seg), ("regime", regime_seg), ("city", trade.get("city") or "UNK")):
+            segment_buckets.setdefault((kind, value), []).append((pred, outcome))
+
+    out: dict[str, list[dict[str, Any]]] = {"market_type": [], "lead_bucket": [], "regime": [], "city": []}
+    for (kind, value), vals in segment_buckets.items():
+        preds = [p for p, _ in vals]
+        outs = [o for _, o in vals]
+        decomp = brier_decomposition(preds, outs)
+        out[kind].append({
+            "segment": value,
+            "trade_count": len(vals),
+            "avg_brier": decomp["brier"],
+            "avg_prediction": sum(preds) / len(preds),
+            "avg_outcome": sum(outs) / len(outs),
+        })
+    for kind in out:
+        out[kind].sort(key=lambda r: (-r["trade_count"], r["segment"]))
+    return out
+
+
+def _save_segment_metrics(conn: sqlite3.Connection, segment_metrics: dict[str, list[dict[str, Any]]]) -> None:
+    conn.execute("DELETE FROM calibration_segments")
+    for kind, rows in segment_metrics.items():
+        for row in rows:
+            conn.execute(
+                """INSERT INTO calibration_segments
+                   (segment_kind, segment_value, trade_count, avg_brier, avg_outcome, avg_prediction)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (kind, row["segment"], row["trade_count"], row["avg_brier"], row["avg_outcome"], row["avg_prediction"]),
+            )
+
+def _save_calibration_profiles(conn: sqlite3.Connection, segment_metrics: dict[str, list[dict[str, Any]]]) -> None:
+    """Persist lightweight per-segment calibration adjustments.
+
+    We intentionally use a simple empirical adjustment (avg_outcome - avg_prediction)
+    instead of fitting a fragile per-segment model on small samples.
+    """
+    conn.execute("DELETE FROM calibration_profiles")
+    for kind, rows in segment_metrics.items():
+        for row in rows:
+            trade_count = int(row.get("trade_count") or 0)
+            if trade_count < 5:
+                continue
+            avg_outcome = float(row.get("avg_outcome") or 0.0)
+            avg_prediction = float(row.get("avg_prediction") or 0.0)
+            prob_adjustment = max(-0.15, min(0.15, avg_outcome - avg_prediction))
+            conn.execute(
+                """INSERT INTO calibration_profiles
+                   (segment_kind, segment_value, trade_count, avg_brier, avg_outcome, avg_prediction, prob_adjustment)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (kind, row["segment"], trade_count, row.get("avg_brier"), avg_outcome, avg_prediction, prob_adjustment),
+            )
+
 
 def _load_resolved_predictions(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(

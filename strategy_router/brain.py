@@ -119,6 +119,13 @@ class Brain:
             except Exception as exc:
                 _log(f"[brain] {strategy.name}.generate_signals failed: {exc}")
 
+        # Stamp a consistent market snapshot time onto all signals for timestamp doctrine.
+        market_snapshot_time = datetime.now(timezone.utc).isoformat()
+        for sig in all_signals:
+            sig.market_snapshot_time = market_snapshot_time
+            if not sig.parse_to_signal_time:
+                sig.parse_to_signal_time = market_snapshot_time
+
         # ------------------------------------------------------------------ #
         # Step 1b: Inject live market prices into open positions
         # ------------------------------------------------------------------ #
@@ -310,25 +317,33 @@ class Brain:
         size_usd: float = order["size_usd"]
         now = datetime.now(timezone.utc).isoformat()
 
+        sig.order_sent_time = datetime.now(timezone.utc).isoformat()
         fill = self.executor.place_order(
             ticker=sig.ticker,
             side=sig.side,
             size_usd=size_usd,
             price=sig.executable_price,
             dry_run=self.dry_run,
+            depth_usd=sig.execution_depth_usd,
         )
+        sig.fill_received_time = fill.get("simulated_at") or fill.get("filled_at") or datetime.now(timezone.utc).isoformat()
         _log(
             f"[brain] ORDER {fill['status']}  {sig.ticker}  {sig.side}  "
             f"${size_usd:.2f} @ {fill['fill_price']:.3f}  "
             f"edge={sig.executable_edge:.3f}"
         )
 
+        actual_size_usd = float(fill.get("fill_size_usd", size_usd) or 0.0)
+        if actual_size_usd <= 0:
+            return
+
         import json as _json
         import uuid as _uuid
+        from execution.orderbook import kalshi_taker_fee
 
-        # Record prediction (Bug 6 fix: include market_id)
-        self.conn.execute(
-            """INSERT OR IGNORE INTO predictions
+        # Record prediction and capture inserted id.
+        pred_cursor = self.conn.execute(
+            """INSERT INTO predictions
                (strategy_name, market_id, ticker, city, target_date,
                 fair_value, market_price, executable_price,
                 edge, executable_edge, confidence,
@@ -343,8 +358,9 @@ class Brain:
                 now,
             ),
         )
+        prediction_id = int(pred_cursor.lastrowid)
+        fill_price = float(fill.get("fill_price", sig.executable_price))
 
-        # Build full entry snapshot for post-trade analysis
         entry_reason = _json.dumps({
             "high_f": sig.high_f,
             "low_f": sig.low_f,
@@ -356,27 +372,32 @@ class Brain:
             "executable_edge": sig.executable_edge,
             "market_price": sig.market_price,
             "fair_value": sig.fair_value,
+            "provider_publish_time": sig.provider_publish_time,
+            "model_run_time": sig.model_run_time,
+            "bot_fetch_time": sig.bot_fetch_time,
+            "parse_to_signal_time": sig.parse_to_signal_time,
+            "market_snapshot_time": sig.market_snapshot_time,
+            "order_sent_time": sig.order_sent_time,
+            "fill_received_time": sig.fill_received_time,
+            "revision_confirmed": sig.revision_confirmed,
+            "revision_delta_f": sig.revision_delta_f,
         })
 
-        # Open position with full snapshot columns for lifecycle engine
-        cursor = self.conn.execute(
+        pos_cursor = self.conn.execute(
             """INSERT INTO positions
-               (strategy_name, market_id, ticker, city, target_date,
+               (prediction_id, strategy_name, market_id, ticker, city, target_date,
                 high_f, low_f, market_type, exchange,
                 side, entry_price, size_usd, status, entry_reason, opened_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'OPENED',?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'OPENED',?,?)""",
             (
-                sig.strategy_name, sig.market_id, sig.ticker, sig.city, sig.target_date,
+                prediction_id, sig.strategy_name, sig.market_id, sig.ticker, sig.city, sig.target_date,
                 sig.high_f, sig.low_f, sig.market_type, sig.source,
-                sig.side, sig.executable_price, size_usd, entry_reason, now,
+                sig.side, sig.executable_price, actual_size_usd, entry_reason, now,
             ),
         )
-        position_id = cursor.lastrowid
+        position_id = pos_cursor.lastrowid
 
-        # Record order (Bug 5 fix)
         order_id = fill.get("order_id") or str(_uuid.uuid4())[:12]
-        from execution.orderbook import kalshi_taker_fee
-        fill_price = fill.get("fill_price", sig.executable_price)
         requested_count = max(1, int(size_usd / max(sig.executable_price, 0.01)))
         self.conn.execute(
             """INSERT INTO orders
@@ -387,8 +408,7 @@ class Brain:
              sig.executable_price, requested_count, fill.get("status", "filled"), now),
         )
 
-        # Record fill (Bug 5 fix)
-        fill_count = max(1, int(size_usd / max(fill_price, 0.01)))
+        fill_count = max(1, int(actual_size_usd / max(fill_price, 0.01)))
         fees_paid = kalshi_taker_fee(fill_price) * fill_count
         self.conn.execute(
             """INSERT INTO fills
@@ -399,10 +419,26 @@ class Brain:
              fees_paid, fill.get("execution_type", "taker"), now),
         )
 
+        self.conn.execute(
+            """INSERT INTO decision_audit
+               (prediction_id, position_id, strategy_name, ticker, city, target_date,
+                provider_publish_time, model_run_time, bot_fetch_time,
+                parse_to_signal_time, market_snapshot_time, order_sent_time,
+                fill_received_time, revision_confirmed, revision_delta_f, source_models)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                prediction_id, position_id, sig.strategy_name, sig.ticker, sig.city, sig.target_date,
+                sig.provider_publish_time, sig.model_run_time, sig.bot_fetch_time,
+                sig.parse_to_signal_time, sig.market_snapshot_time, sig.order_sent_time,
+                sig.fill_received_time, 1 if sig.revision_confirmed else 0, sig.revision_delta_f,
+                None,
+            ),
+        )
+
         # Deduct from bankroll, sync cash_available
         self.conn.execute(
             "UPDATE portfolio SET bankroll = bankroll - ?, updated_at=? WHERE id=1",
-            (size_usd, now),
+            (actual_size_usd, now),
         )
         self.conn.execute(
             """UPDATE portfolio SET

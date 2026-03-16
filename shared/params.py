@@ -33,6 +33,11 @@ class Params:
     # Risk
     # ------------------------------------------------------------------ #
     max_cluster_exposure_pct: float = 0.15   # max 15% bankroll in one cluster
+    max_city_exposure_pct: float = 0.15      # max 15% bankroll of gross notional in one city
+    max_portfolio_var95_pct: float = 0.10    # halt/reject if proxy daily VaR95 exceeds 10% bankroll
+    same_city_corr: float = 0.85
+    same_cluster_corr: float = 0.50
+    cross_cluster_corr: float = 0.20
     max_positions_per_city: int = 3
     stale_forecast_hours: float = 6.0        # halt if forecast older than this
     max_round_trips_per_day: int = 3
@@ -54,6 +59,7 @@ class Params:
     min_kelly_fraction: float = 0.01     # skip bets below 1% Kelly
     max_kelly_fraction: float = 0.25     # cap at 25% Kelly
     use_monte_carlo: bool = True         # use MC probability engine vs Gaussian CDF
+    use_empirical_ensemble: bool = True  # use true ensemble members when available
     monte_carlo_samples: int = 2000      # MC samples per probability estimate
     # Time-decaying edge threshold: min_edge = base_edge + alpha * exp(beta * hours_to_settlement)
     # At 48h: base_edge + alpha * exp(48 * beta); at 2h: base_edge + alpha * exp(2 * beta)

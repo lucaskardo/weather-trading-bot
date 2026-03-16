@@ -234,6 +234,7 @@ class ValueEntryStrategy(BaseStrategy):
                 n_models=n_models,
                 model_temps_f=model_highs,
                 side=side,
+                execution_depth_usd=exec_info.depth_usd,
                 subtitle=f"consensus={consensus_f:.1f}°F, edge={executable_edge:.3f}",
             )
             signals.append(sig)

@@ -573,6 +573,16 @@ class TestProcessPosition:
         assert action.next_status == PositionStatus.HOLDING
         assert action.should_execute is False
 
+    def test_convergence_uses_net_exit_value(self, monkeypatch):
+        pos = _position(status="HOLDING", side="YES", current_price=0.60, entry_price=0.45, high_f=80.0)
+        forecasts = [_fresh_forecast(high_f=80.0, hours_ago=1.0)]
+
+        # Raw screen price is far from fair value, but executable exit price converges.
+        monkeypatch.setattr("execution.lifecycle.get_exit_price", lambda price, side, params: 0.50)
+        action = process_position(pos, forecasts, params=_params())
+        assert action.next_status == PositionStatus.EXITED_CONVERGENCE
+        assert action.reason == "market_converged"
+
     def test_returns_lifecycle_action_type(self):
         pos = _position(status="HOLDING")
         forecasts = [_fresh_forecast(hours_ago=1.0)]

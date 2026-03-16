@@ -340,3 +340,30 @@ class ExperimentRegistry:
     def _describe(self, params: dict) -> str:
         parts = [f"{k}={v:.3f}" for k, v in params.items()]
         return "candidate: " + ", ".join(parts)
+
+
+def recent_autoresearch_summary(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Lightweight dashboard summary for the autoresearch loop."""
+    last_exp = conn.execute(
+        """SELECT id, description, status, baseline_brier, candidate_brier,
+                  improvement_pct, created_at, completed_at
+           FROM experiments
+           ORDER BY COALESCE(completed_at, created_at) DESC
+           LIMIT 1"""
+    ).fetchone()
+    promoted = conn.execute(
+        "SELECT key, value, source_exp, promoted_at FROM promoted_params ORDER BY promoted_at DESC"
+    ).fetchall()
+    pred = conn.execute(
+        """SELECT COUNT(*) as n, AVG(brier_score) as avg_brier,
+                  AVG(CASE WHEN realized_pnl IS NOT NULL THEN realized_pnl END) as avg_pnl
+           FROM predictions
+           WHERE brier_score IS NOT NULL"""
+    ).fetchone()
+    return {
+        "last_experiment": dict(last_exp) if last_exp else {},
+        "promoted_params": [dict(r) for r in promoted],
+        "resolved_predictions": int((pred[0] if pred else 0) or 0),
+        "avg_brier": float((pred[1] if pred else 0.0) or 0.0),
+        "avg_realized_pnl": float((pred[2] if pred else 0.0) or 0.0),
+    }

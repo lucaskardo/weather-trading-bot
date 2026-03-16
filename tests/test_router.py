@@ -458,3 +458,24 @@ class TestStartupChecks:
         p = _params(router_w_sharpe=0.99)  # weights no longer sum to 1
         with pytest.raises(AssertionError):
             _check_params_sanity(p)
+
+
+def test_selector_skips_when_var95_cap_breached():
+    from strategy_router.selector import select_signals
+    from strategies.base import Signal
+    from shared.params import Params
+
+    sig = Signal(
+        strategy_name="value_entry", market_id="mvar", ticker="TKR", city="NYC", target_date="2099-07-01",
+        market_type="above", high_f=80.0, low_f=None, market_price=0.45, executable_price=0.46,
+        fair_value=0.70, side="YES", edge=0.25, executable_edge=0.24, confidence=0.9,
+        effective_prob=0.70, effective_price=0.46, source="kalshi"
+    )
+    open_positions = [
+        {"city": "CHI", "size_usd": 220.0, "side": "YES", "market_type": "above"},
+        {"city": "MIA", "size_usd": 220.0, "side": "YES", "market_type": "above"},
+    ]
+    params = Params()
+    params.max_portfolio_var95_pct = 0.05
+    orders = select_signals([sig], {"value_entry": 100.0}, open_positions, bankroll=1000.0, params=params)
+    assert orders[0]["reason_skipped"] == "var95_cap"
